@@ -1,0 +1,22 @@
+{
+  "raw_dir": "data/raw",
+  "processed_dir": "data/processed",
+  "results_dir": "results",
+  "heart_counts_file": "heart_salmon.merged.gene_counts.tsv",
+  "organoid_counts_file": "organoid_salmon.merged.gene_counts.tsv",
+  "metadata_file": "Copy of Master miRNA-Seq & RNA-Seq comparison sheet.xlsx",
+  "metadata_sheet": "RNA_update",
+  "heart_group_order": [
+    "NL_Sham_Ctrl",
+    "HU_Sham_Ctrl",
+    "NL_Sham_KMP",
+    "HU_Sham_KMP",
+    "NL_IR_Ctrl",
+    "HU_IR_Ctrl",
+    "NL_IR_KMP",
+    "HU_IR_KMP"
+  ],
+  "heart_samples_per_group": 10,
+  "qc_min_count": 10,
+  "qc_report_output": "results/reports/01_qcPreprocessing.html"
+}

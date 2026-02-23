@@ -1,0 +1,363 @@
+---
+title: "QC & Exploratory Analysis — Orbital Mus"
+author: "Orbital Mus Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+params:
+  proj_root: !r rprojroot::find_root(rprojroot::is_git_root)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = TRUE, message = FALSE,
+  fig.width = 10, fig.height = 6
+)
+```
+
+```{r libraries}
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(jsonlite)
+library(dplyr)
+```
+
+```{r load-data}
+proj_root <- params$proj_root
+cfg <- fromJSON(file.path(proj_root, "scripts", "setup", "config.json"))
+proc_dir  <- file.path(proj_root, cfg$processed_dir)
+
+heart_counts   <- readRDS(file.path(proc_dir, "heart_counts.rds"))
+heart_coldata  <- readRDS(file.path(proc_dir, "heart_coldata.rds"))
+organoid_counts  <- readRDS(file.path(proc_dir, "organoid_counts.rds"))
+organoid_coldata <- readRDS(file.path(proc_dir, "organoid_coldata.rds"))
+
+min_count <- cfg$qc_min_count
+```
+
+This report evaluates QC metrics for two bulk RNA-seq datasets from the Orbital Mus project:
+
+- **Heart tissue**: `r ncol(heart_counts)` mouse samples, 2×2×2 factorial (HU/NL × IR/Sham × KMP/Ctrl)
+- **Cardiac organoid**: `r ncol(organoid_counts)` human samples, multi-factorial (Beam × Treatment × Timepoint × Batch)
+
+QC is diagnostic only — no filtered or normalized matrices are saved.
+
+---
+
+# Heart Tissue {.tabset}
+
+## Library Sizes
+
+```{r heart-libsize, fig.height=5}
+heart_libsize <- data.frame(
+  sample = colnames(heart_counts),
+  total  = colSums(heart_counts),
+  group  = heart_coldata$group,
+  stringsAsFactors = FALSE
+)
+
+# IQR outlier threshold
+q1  <- quantile(heart_libsize$total, 0.25)
+iqr <- IQR(heart_libsize$total)
+outlier_threshold <- q1 - 1.5 * iqr
+heart_libsize$outlier <- heart_libsize$total < outlier_threshold
+
+n_outliers_heart_lib <- sum(heart_libsize$outlier)
+
+ggplot(heart_libsize, aes(x = reorder(sample, total), y = total / 1e6, fill = group)) +
+  geom_col() +
+  geom_hline(yintercept = outlier_threshold / 1e6, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(
+    title = "Heart: Per-Sample Library Size",
+    x = NULL, y = "Total counts (millions)",
+    caption = paste0("Red line: IQR outlier threshold (Q1 - 1.5×IQR = ",
+                     format(round(outlier_threshold), big.mark = ","), ")")
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.y = element_text(size = 5))
+```
+
+`r if (n_outliers_heart_lib > 0) paste0("**⚠ ", n_outliers_heart_lib, " sample(s) flagged as library-size outliers:** ", paste(heart_libsize$sample[heart_libsize$outlier], collapse = ", ")) else "No library-size outliers detected."`
+
+## Gene Filtering
+
+```{r heart-filter}
+# Keep genes with >= min_count in at least N samples (N = smallest group size)
+heart_min_samples <- min(table(heart_coldata$group))
+heart_keep <- rowSums(heart_counts >= min_count) >= heart_min_samples
+heart_n_keep <- sum(heart_keep)
+heart_n_remove <- sum(!heart_keep)
+
+cat(sprintf(
+  "Gene filtering (>=%d counts in >=%d samples):\n  Retained: %s genes\n  Removed:  %s genes (%.1f%%)\n",
+  min_count, heart_min_samples,
+  format(heart_n_keep, big.mark = ","),
+  format(heart_n_remove, big.mark = ","),
+  100 * heart_n_remove / nrow(heart_counts)
+))
+```
+
+## VST + PCA {.tabset}
+
+```{r heart-vst}
+heart_counts_filt <- heart_counts[heart_keep, ]
+heart_dds <- DESeqDataSetFromMatrix(
+  countData = heart_counts_filt,
+  colData   = heart_coldata,
+  design    = ~ 1
+)
+heart_vst <- vst(heart_dds, blind = TRUE)
+```
+
+### PCA — HU
+
+```{r heart-pca-hu, fig.height=5}
+plotPCA(heart_vst, intgroup = "HU") +
+  ggtitle("Heart PCA: HU (Hindlimb Unloading)") +
+  theme_minimal()
+```
+
+### PCA — IR
+
+```{r heart-pca-ir, fig.height=5}
+plotPCA(heart_vst, intgroup = "IR") +
+  ggtitle("Heart PCA: IR (Irradiation)") +
+  theme_minimal()
+```
+
+### PCA — KMP
+
+```{r heart-pca-kmp, fig.height=5}
+plotPCA(heart_vst, intgroup = "KMP") +
+  ggtitle("Heart PCA: KMP (Treatment)") +
+  theme_minimal()
+```
+
+### PCA — Group
+
+```{r heart-pca-group, fig.height=5}
+plotPCA(heart_vst, intgroup = "group") +
+  ggtitle("Heart PCA: Full Group") +
+  theme_minimal()
+```
+
+## Sample Distance Heatmap
+
+```{r heart-heatmap, fig.height=8, fig.width=9}
+heart_dist <- dist(t(assay(heart_vst)))
+heart_dist_mat <- as.matrix(heart_dist)
+
+heart_anno <- data.frame(
+  HU  = heart_coldata$HU,
+  IR  = heart_coldata$IR,
+  KMP = heart_coldata$KMP,
+  row.names = rownames(heart_coldata)
+)
+
+pheatmap(
+  heart_dist_mat,
+  clustering_distance_rows = heart_dist,
+  clustering_distance_cols = heart_dist,
+  annotation_col = heart_anno,
+  main = "Heart: Sample-to-Sample Euclidean Distance",
+  fontsize_row = 5, fontsize_col = 5
+)
+```
+
+## Outlier Summary
+
+```{r heart-outliers}
+# PCA-based outlier detection: flag samples > 3 SD from centroid on PC1/PC2
+heart_pca_data <- plotPCA(heart_vst, intgroup = "group", returnData = TRUE)
+heart_centroid <- c(mean(heart_pca_data$PC1), mean(heart_pca_data$PC2))
+heart_pca_data$dist_to_centroid <- sqrt(
+  (heart_pca_data$PC1 - heart_centroid[1])^2 +
+  (heart_pca_data$PC2 - heart_centroid[2])^2
+)
+pca_mean <- mean(heart_pca_data$dist_to_centroid)
+pca_sd   <- sd(heart_pca_data$dist_to_centroid)
+heart_pca_data$pca_outlier <- heart_pca_data$dist_to_centroid > (pca_mean + 3 * pca_sd)
+
+heart_outlier_summary <- data.frame(
+  sample = heart_libsize$sample,
+  library_size_outlier = heart_libsize$outlier,
+  pca_outlier = heart_pca_data$pca_outlier[match(heart_libsize$sample, heart_pca_data$name)]
+)
+heart_outlier_summary$any_flag <- heart_outlier_summary$library_size_outlier |
+                                  heart_outlier_summary$pca_outlier
+
+flagged <- heart_outlier_summary[heart_outlier_summary$any_flag, ]
+if (nrow(flagged) > 0) {
+  cat("Flagged heart samples:\n")
+  print(flagged)
+} else {
+  cat("No heart samples flagged as outliers.\n")
+}
+```
+
+---
+
+# Cardiac Organoid {.tabset}
+
+## Library Sizes
+
+```{r organoid-libsize, fig.height=5}
+organoid_libsize <- data.frame(
+  sample = colnames(organoid_counts),
+  total  = colSums(organoid_counts),
+  group  = organoid_coldata$group,
+  batch  = organoid_coldata$batch,
+  stringsAsFactors = FALSE
+)
+
+q1_o  <- quantile(organoid_libsize$total, 0.25)
+iqr_o <- IQR(organoid_libsize$total)
+outlier_threshold_o <- q1_o - 1.5 * iqr_o
+organoid_libsize$outlier <- organoid_libsize$total < outlier_threshold_o
+
+n_outliers_org_lib <- sum(organoid_libsize$outlier)
+
+ggplot(organoid_libsize, aes(x = reorder(sample, total), y = total / 1e6, fill = group)) +
+  geom_col() +
+  geom_hline(yintercept = outlier_threshold_o / 1e6, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(
+    title = "Organoid: Per-Sample Library Size",
+    x = NULL, y = "Total counts (millions)",
+    caption = paste0("Red line: IQR outlier threshold (Q1 - 1.5×IQR = ",
+                     format(round(outlier_threshold_o), big.mark = ","), ")")
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.y = element_text(size = 6))
+```
+
+`r if (n_outliers_org_lib > 0) paste0("**⚠ ", n_outliers_org_lib, " sample(s) flagged as library-size outliers:** ", paste(organoid_libsize$sample[organoid_libsize$outlier], collapse = ", ")) else "No library-size outliers detected."`
+
+## Gene Filtering
+
+```{r organoid-filter}
+organoid_min_samples <- min(table(organoid_coldata$group))
+organoid_keep <- rowSums(organoid_counts >= min_count) >= organoid_min_samples
+organoid_n_keep <- sum(organoid_keep)
+organoid_n_remove <- sum(!organoid_keep)
+
+cat(sprintf(
+  "Gene filtering (>=%d counts in >=%d samples):\n  Retained: %s genes\n  Removed:  %s genes (%.1f%%)\n",
+  min_count, organoid_min_samples,
+  format(organoid_n_keep, big.mark = ","),
+  format(organoid_n_remove, big.mark = ","),
+  100 * organoid_n_remove / nrow(organoid_counts)
+))
+```
+
+## VST + PCA {.tabset}
+
+```{r organoid-vst}
+organoid_counts_filt <- organoid_counts[organoid_keep, ]
+organoid_dds <- DESeqDataSetFromMatrix(
+  countData = organoid_counts_filt,
+  colData   = organoid_coldata,
+  design    = ~ 1
+)
+organoid_vst <- vst(organoid_dds, blind = TRUE)
+```
+
+### PCA — Batch
+
+```{r organoid-pca-batch, fig.height=5}
+plotPCA(organoid_vst, intgroup = "batch") +
+  ggtitle("Organoid PCA: Batch") +
+  theme_minimal()
+```
+
+### PCA — Beam
+
+```{r organoid-pca-beam, fig.height=5}
+plotPCA(organoid_vst, intgroup = "beam") +
+  ggtitle("Organoid PCA: Beam (Irradiation)") +
+  theme_minimal()
+```
+
+### PCA — Treatment
+
+```{r organoid-pca-treatment, fig.height=5}
+plotPCA(organoid_vst, intgroup = "treatment") +
+  ggtitle("Organoid PCA: Treatment (KMP/Control)") +
+  theme_minimal()
+```
+
+### PCA — Timepoint
+
+```{r organoid-pca-timepoint, fig.height=5}
+plotPCA(organoid_vst, intgroup = "timepoint") +
+  ggtitle("Organoid PCA: Timepoint (Day2/Day9)") +
+  theme_minimal()
+```
+
+## Sample Distance Heatmap
+
+```{r organoid-heatmap, fig.height=8, fig.width=9}
+organoid_dist <- dist(t(assay(organoid_vst)))
+organoid_dist_mat <- as.matrix(organoid_dist)
+
+organoid_anno <- data.frame(
+  Batch     = organoid_coldata$batch,
+  Beam      = organoid_coldata$beam,
+  Treatment = organoid_coldata$treatment,
+  Timepoint = organoid_coldata$timepoint,
+  row.names = rownames(organoid_coldata)
+)
+
+pheatmap(
+  organoid_dist_mat,
+  clustering_distance_rows = organoid_dist,
+  clustering_distance_cols = organoid_dist,
+  annotation_col = organoid_anno,
+  main = "Organoid: Sample-to-Sample Euclidean Distance",
+  fontsize_row = 6, fontsize_col = 6
+)
+```
+
+## Outlier Summary
+
+```{r organoid-outliers}
+organoid_pca_data <- plotPCA(organoid_vst, intgroup = "group", returnData = TRUE)
+org_centroid <- c(mean(organoid_pca_data$PC1), mean(organoid_pca_data$PC2))
+organoid_pca_data$dist_to_centroid <- sqrt(
+  (organoid_pca_data$PC1 - org_centroid[1])^2 +
+  (organoid_pca_data$PC2 - org_centroid[2])^2
+)
+org_pca_mean <- mean(organoid_pca_data$dist_to_centroid)
+org_pca_sd   <- sd(organoid_pca_data$dist_to_centroid)
+organoid_pca_data$pca_outlier <- organoid_pca_data$dist_to_centroid > (org_pca_mean + 3 * org_pca_sd)
+
+organoid_outlier_summary <- data.frame(
+  sample = organoid_libsize$sample,
+  library_size_outlier = organoid_libsize$outlier,
+  pca_outlier = organoid_pca_data$pca_outlier[match(organoid_libsize$sample, organoid_pca_data$name)]
+)
+organoid_outlier_summary$any_flag <- organoid_outlier_summary$library_size_outlier |
+                                     organoid_outlier_summary$pca_outlier
+
+flagged_org <- organoid_outlier_summary[organoid_outlier_summary$any_flag, ]
+if (nrow(flagged_org) > 0) {
+  cat("Flagged organoid samples:\n")
+  print(flagged_org)
+} else {
+  cat("No organoid samples flagged as outliers.\n")
+}
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

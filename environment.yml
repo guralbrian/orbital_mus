@@ -1,0 +1,14 @@
+name: orbital_mus
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base>=4.4.0,<4.5
+  - r-tidyverse
+  - r-biocmanager
+  - r-jsonlite
+  - r-readxl
+  - r-rmarkdown
+  - r-pheatmap
+  - bioconductor-deseq2
+  - compilers
