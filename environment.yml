@@ -3,6 +3,9 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
+  - python>=3.12,<3.13
+  - snakemake>=8.0
+  - snakemake-executor-plugin-slurm
   - r-base>=4.4.0,<4.5
   - r-tidyverse
   - r-biocmanager

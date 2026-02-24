@@ -4,9 +4,11 @@ configfile: "scripts/setup/config.json"
 
 rule all:
     input:
-        expand("data/processed/{dataset}_{suffix}.rds",
+        expand("data/processed/{dataset}_counts.rds",
+               dataset=["heart", "organoid"]),
+        expand("data/processed/{dataset}_{suffix}.csv",
                dataset=["heart", "organoid"],
-               suffix=["counts", "coldata", "gene_names"]),
+               suffix=["coldata", "gene_names"]),
         "data/processed/contrast_definitions.rds",
         config["qc_report_output"]
 
@@ -17,9 +19,11 @@ rule load_data:
         metadata = "data/raw/" + config["metadata_file"],
         config_file = "scripts/setup/config.json"
     output:
-        expand("data/processed/{dataset}_{suffix}.rds",
+        expand("data/processed/{dataset}_counts.rds",
+               dataset=["heart", "organoid"]),
+        expand("data/processed/{dataset}_{suffix}.csv",
                dataset=["heart", "organoid"],
-               suffix=["counts", "coldata", "gene_names"]),
+               suffix=["coldata", "gene_names"]),
         "data/processed/contrast_definitions.rds"
     resources:
         mem_mb = 4000
@@ -28,9 +32,10 @@ rule load_data:
 
 rule qc_report:
     input:
-        expand("data/processed/{dataset}_{suffix}.rds",
-               dataset=["heart", "organoid"],
-               suffix=["counts", "coldata"]),
+        expand("data/processed/{dataset}_counts.rds",
+               dataset=["heart", "organoid"]),
+        expand("data/processed/{dataset}_coldata.csv",
+               dataset=["heart", "organoid"]),
         config_file = "scripts/setup/config.json",
         rmd = "scripts/intake/01_runQc.Rmd"
     output:
@@ -38,7 +43,9 @@ rule qc_report:
     resources:
         mem_mb = 8000
     params:
-        output_path = lambda wildcards, output: os.path.abspath(str(output))
+        output_path = lambda wildcards, output: os.path.abspath(str(output)),
+        proj_root = os.getcwd()
     shell:
         "Rscript -e \"rmarkdown::render('{input.rmd}', "
+        "params=list(proj_root='{params.proj_root}'), "
         "output_file='{params.output_path}')\""

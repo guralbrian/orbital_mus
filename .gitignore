@@ -21,6 +21,9 @@ results/
 .Ruserdata
 *.Rproj
 
+# Snakemake
+.snakemake/
+
 # DAG visualization
 dag.svg
 
