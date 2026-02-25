@@ -18,5 +18,15 @@
   ],
   "heart_samples_per_group": 10,
   "qc_min_count": 10,
-  "qc_report_output": "results/reports/01_qcPreprocessing.html"
+  "qc_report_output": "results/reports/01_qcPreprocessing.html",
+  "decon_references": [
+    "bulk_decon",
+    "mortazavi_general",
+    "mortazavi_celltype",
+    "mortazavi_b6j"
+  ],
+  "de_min_count": 10,
+  "de_min_samples": 4,
+  "de_alpha": 0.05,
+  "decon_report_output": "results/reports/02_deconSummary.html"
 }

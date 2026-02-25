@@ -1,0 +1,23 @@
+name: orbital_mus_music
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base>=4.3.0,<4.4
+  - r-matrix
+  - r-nnls
+  - r-ggplot2
+  - r-mcmcpack
+  - r-reshape2
+  - r-dplyr
+  - r-tibble
+  - r-jsonlite
+  - r-devtools
+  - bioconductor-biobase
+  - bioconductor-singlecellexperiment
+  - bioconductor-summarizedexperiment
+  - bioconductor-toast
+  - compilers
+  # After creating this env, install MuSiC (not on conda):
+  #   conda activate orbital_mus_music
+  #   Rscript -e "devtools::install_github('xuranw/MuSiC')"
