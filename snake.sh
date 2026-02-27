@@ -8,8 +8,9 @@
 eval "$(conda shell.bash hook)"
 conda activate orbital_mus
 
-snakemake -j 4 --latency-wait 60 \
+snakemake -j 64 --latency-wait 120 \
     --executor slurm \
+    --rerun-incomplete \
     --default-resources mem_mb=4000 runtime=120 nodes=1 tasks=1 cpus_per_task=4 slurm_account=rc_chrau_pi
 
 snakemake --rulegraph | dot -Tsvg > dag.svg

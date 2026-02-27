@@ -1,5 +1,5 @@
 ---
-title: "Decon and Differential Expression Summary"
+title: "Deconvolution, Differential Expression, and GSEA Summary"
 author: "Orbital Mus Pipeline"
 date: "`r Sys.Date()`"
 output:
@@ -27,6 +27,10 @@ library(stringr)
 library(RColorBrewer)
 library(pheatmap)
 library(jsonlite)
+library(ggrepel)
+library(ggrastr)
+library(patchwork)
+library(ComplexUpset)
 ```
 
 ```{r load-data}
@@ -40,42 +44,144 @@ alpha <- cfg$de_alpha
 compositions <- lapply(refs, function(ref) {
   read.csv(file.path(proc_dir, "decon", paste0(ref, "_compositions.csv"))) |>
     mutate(reference = ref)
-}) |>
-  bind_rows()
+}) |> bind_rows()
 
 comparisons <- lapply(refs, function(ref) {
   read.csv(file.path(proc_dir, "models", paste0(ref, "_de_comparison.csv"))) |>
     mutate(reference = ref)
-}) |>
-  bind_rows()
+}) |> bind_rows()
 
 markers <- lapply(refs, function(ref) {
   read.csv(file.path(proc_dir, "decon", paste0(ref, "_markers.csv"))) |>
     mutate(reference = ref)
-}) |>
-  bind_rows()
+}) |> bind_rows()
 
-group_pal <- brewer.pal(8, "Set2")
-names(group_pal) <- cfg$heart_group_order
+clr_covariates <- lapply(refs, function(ref) {
+  f <- file.path(proc_dir, "models", paste0(ref, "_clr_covariates.csv"))
+  if (file.exists(f)) read.csv(f) else NULL
+}) |> bind_rows()
+
+dirichlet_coefs <- lapply(refs, function(ref) {
+  f <- file.path(proc_dir, "models", paste0(ref, "_dirichlet_coefficients.csv"))
+  if (file.exists(f)) read.csv(f) |> mutate(reference = ref) else NULL
+}) |> bind_rows()
+
+contrast_indices <- lapply(refs, function(ref) {
+  f <- file.path(proc_dir, "models", paste0(ref, "_contrast_index.csv"))
+  if (file.exists(f)) read.csv(f) |> mutate(reference = ref) else NULL
+}) |> bind_rows()
+
+# Load DE results RDS for volcanos and UpSet (need per-contrast data frames)
+results_adj <- lapply(refs, function(ref) {
+  f <- file.path(proc_dir, "models", paste0(ref, "_results_adjusted.rds"))
+  if (file.exists(f)) readRDS(f) else NULL
+})
+names(results_adj) <- refs
+
+results_unadj <- lapply(refs, function(ref) {
+  f <- file.path(proc_dir, "models", paste0(ref, "_results_unadjusted.rds"))
+  if (file.exists(f)) readRDS(f) else NULL
+})
+names(results_unadj) <- refs
+
+# Gene name map
+gene_map <- read.csv(file.path(proc_dir, "heart_gene_names.csv"))
+
+# Load GSEA summaries (may not exist for all refs/models during troubleshooting)
+gsea_summaries <- lapply(refs, function(ref) {
+  lapply(c("adjusted", "unadjusted"), function(model) {
+    f <- file.path(proc_dir, "gsea", paste0(ref, "_", model, "_combined.csv"))
+    if (file.exists(f)) read.csv(f) else NULL
+  }) |> bind_rows()
+}) |> bind_rows()
 ```
 
-This report summarizes [MuSiC](https://doi.org/10.1038/s41467-018-08023-x) cell
-type deconvolution of ~120 orbital unloading mouse heart samples across
-**`r length(refs)` single-cell references**, followed by CLR-adjusted DESeq2
-differential expression analysis.
+```{r palettes}
+# Group palette
+group_pal <- brewer.pal(8, "Set2")
+names(group_pal) <- cfg$heart_group_order
 
-**References:**
+# Key contrasts for focused plots
+key_contrasts <- c(
+  "HU_vs_NL_MAIN_EFFECT", "IR_vs_Sham_MAIN_EFFECT", "KMP_vs_Sham_MAIN_EFFECT",
+  "Interaction_KMP_x_HU", "Interaction_KMP_x_IR", "Interaction_HU_x_IR"
+)
 
-- **bulk_decon** — 4 cell types from C57BL/6J left ventricle
+# Readable contrast labels
+contrast_labels <- c(
+  "HU_vs_NL_MAIN_EFFECT" = "HU vs NL",
+  "IR_vs_Sham_MAIN_EFFECT" = "IR vs Sham",
+  "KMP_vs_Sham_MAIN_EFFECT" = "KMP vs Ctrl",
+  "Interaction_KMP_x_HU" = "KMP x HU",
+  "Interaction_KMP_x_IR" = "KMP x IR",
+  "Interaction_HU_x_IR" = "HU x IR"
+)
+
+# Consistent cell type colors across references via family mapping
+celltype_families <- list(
+  cardiomyocyte = c("Cardiomyocytes", "muscle",
+                    "ventricular cardiac myocyte",
+                    "atrial cardiac myocyte"),
+  fibroblast = c("Fibroblast", "stromal", "fibroblast"),
+  immune = c("Macrophage", "immune", "macrophage", "B cell", "T cell"),
+  pericyte = c("Pericytes/SMC", "pericyte", "smooth muscle cell"),
+  endothelial = c("endothelial", "endothelial cell",
+                  "lymphatic endothelial cell", "endocardial cell"),
+  neural = c("neural", "neuron", "Schwann cell"),
+  adipocyte = c("adipocyte")
+)
+
+family_colors <- c(
+  cardiomyocyte = "#66C2A5", fibroblast = "#FC8D62", immune = "#8DA0CB",
+  pericyte = "#E78AC3", endothelial = "#A6D854", neural = "#FFD92F",
+  adipocyte = "#E5C494"
+)
+
+# Map each cell type to its family color
+all_celltypes <- unique(compositions$CellType)
+celltype_pal <- setNames(rep("#B3B3B3", length(all_celltypes)), all_celltypes)
+for (fam in names(celltype_families)) {
+  for (ct in all_celltypes) {
+    if (any(sapply(celltype_families[[fam]], function(pat) grepl(pat, ct, ignore.case = TRUE)))) {
+      celltype_pal[ct] <- family_colors[fam]
+    }
+  }
+}
+
+# Base theme for all plots
+theme_report <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      text = element_text(size = 8),
+      panel.grid.minor = element_blank(),
+      plot.background = element_rect(fill = "transparent", color = NA),
+      legend.background = element_rect(fill = "transparent")
+    )
+}
+```
+
+# Introduction
+
+This report summarizes cell type deconvolution, differential expression, and
+gene set enrichment analysis of ~80 mouse heart samples from an orbital
+unloading experiment (2x2x2 factorial: HU/NL x IR/Sham x KMP/Ctrl).
+
+**Single-cell references:**
+
+- **bulk_decon** -- 4 cell types from C57BL/6J left ventricle
   ([Gural et al. 2025](https://doi.org/10.1371/journal.pgen.1011807))
-- **mortazavi_general** — 8 major cell types across all strains
+- **mortazavi_general** -- 8 major cell types across all strains
   ([IGVF Mortazavi lab](https://pubmed.ncbi.nlm.nih.gov/41478285/))
-- **mortazavi_celltype** — 14 granular cell types from the same atlas
-- **mortazavi_b6j** — 8 cell types restricted to C57BL/6J samples
+- **mortazavi_celltype** -- 14 granular cell types from the same atlas
+- **mortazavi_b6j** -- 8 cell types restricted to C57BL/6J samples
 
-Each reference contributes 15 markers per cell type selected by log-fold change.
-Deconvolution uses MuSiC defaults; DESeq2 models include CLR-transformed
-composition covariates.
+**Analytical approach:**
+
+1. MuSiC deconvolution with 15 markers per cell type
+2. CLR-transformed top-2 cell type covariates for composition-adjusted DE
+3. DESeq2 cell-means model (~ 0 + group) with ashr shrinkage, 19 contrasts
+4. Dirichlet regression on compositions (3-factor design)
+5. GSEA (GO-BP + KEGG) on ranked gene lists
 
 Source: [github.com/guralbrian/orbital_mus](https://github.com/guralbrian/orbital_mus)
 
@@ -89,23 +195,15 @@ for (ref in refs) {
 
   comp_ref <- compositions |> filter(reference == ref)
 
-  # Cell types ordered by descending mean proportion
   cell_order <- comp_ref |>
     group_by(CellType) |>
     summarise(mean_prop = mean(Prop, na.rm = TRUE), .groups = "drop") |>
     arrange(desc(mean_prop)) |>
     pull(CellType)
 
-  # Build a Set2-extended palette for references with >8 cell types
-  n_types <- length(cell_order)
-  set2_ct <- if (n_types <= 8) {
-    brewer.pal(max(3, n_types), "Set2")[seq_len(n_types)]
-  } else {
-    colorRampPalette(brewer.pal(8, "Set2"))(n_types)
-  }
-  names(set2_ct) <- cell_order
+  # Use family-consistent palette, ordered by abundance
+  ct_pal <- celltype_pal[cell_order]
 
-  # Sort samples within each group by dominant cell type
   sample_order <- comp_ref |>
     group_by(group, sample_id) |>
     slice_max(Prop, n = 1, with_ties = FALSE) |>
@@ -124,39 +222,33 @@ for (ref in refs) {
   p_bar <- ggplot(comp_ref, aes(x = sample_id, y = Prop, fill = CellType)) +
     geom_col(color = "black", linewidth = 0.1) +
     facet_wrap(~ group, scales = "free_x") +
-    scale_fill_manual(values = set2_ct,
-                      labels = function(x) str_wrap(x, width = 12)) +
-    labs(title = paste0("Cell Type Proportions \u2014 ", ref),
+    scale_fill_manual(values = ct_pal,
+                      labels = function(x) str_wrap(x, width = 15)) +
+    labs(title = paste0("Cell Type Proportions -- ", ref),
          x = NULL, y = "Proportion", fill = "Cell Type") +
-    theme_minimal(base_size = 10) +
+    theme_report() +
     theme(
       axis.text.x = element_text(angle = 90, hjust = 1, size = 4),
-      text = element_text(size = 8),
-      strip.text = element_text(size = 7),
-      panel.grid.minor = element_blank()
+      strip.text = element_text(size = 7)
     )
   print(p_bar)
-
   cat("\n\n")
 
-  # Grouped mean bars + jitter
+  # Mean bars + jitter
   p_mean <- ggplot(comp_ref, aes(x = group, y = Prop, fill = group)) +
     geom_bar(stat = "summary", fun = mean, width = 0.7,
              color = "black", linewidth = 0.2) +
     geom_jitter(width = 0.15, alpha = 0.5, size = 1) +
     facet_wrap(~ CellType, scales = "free_y") +
     scale_fill_manual(values = group_pal) +
-    labs(title = paste0("Mean Proportions by Group \u2014 ", ref),
+    labs(title = paste0("Mean Proportions by Group -- ", ref),
          x = NULL, y = "Proportion", fill = "Group") +
-    theme_minimal(base_size = 10) +
+    theme_report() +
     theme(
       axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
-      text = element_text(size = 8),
-      legend.position = "none",
-      panel.grid.minor = element_blank()
+      legend.position = "none"
     )
   print(p_mean)
-
   cat("\n\n")
 
   # Mean proportions table
@@ -165,55 +257,15 @@ for (ref in refs) {
     summarise(mean_prop = mean(Prop, na.rm = TRUE), .groups = "drop") |>
     pivot_wider(names_from = CellType, values_from = mean_prop)
   print(knitr::kable(mean_tbl, digits = 4,
-                     caption = paste0("Mean proportions \u2014 ", ref)))
-
+                     caption = paste0("Mean proportions -- ", ref)))
   cat("\n\n")
-}
-```
 
----
-
-# Marker Specificity {.tabset}
-
-```{r marker-tabs, results='asis', fig.height=5, fig.width=8}
-for (ref in refs) {
-  cat("\n\n##", ref, "\n\n")
-
-  mk_ref <- markers |>
-    filter(reference == ref) |>
-    group_by(celltype) |>
-    slice_max(summary.logFC, n = 3, with_ties = FALSE) |>
-    ungroup()
-
-  # Genes ordered by cell type grouping
-  gene_order <- mk_ref |>
-    arrange(celltype, desc(summary.logFC)) |>
-    pull(gene) |>
-    unique()
-
-  mk_ref <- mk_ref |>
-    mutate(
-      neg_log10_fdr = -log10(pmax(FDR, 1e-300)),
-      gene = factor(gene, levels = gene_order)
-    )
-
-  p_dot <- ggplot(mk_ref, aes(x = gene, y = celltype,
-                               size = summary.logFC, color = neg_log10_fdr)) +
-    geom_point() +
-    scale_color_viridis_c(option = "magma", name = "-log10(FDR)") +
-    scale_size_continuous(name = "logFC", range = c(1, 6)) +
-    labs(title = paste0("Top Markers \u2014 ", ref), x = NULL, y = NULL) +
-    theme_minimal(base_size = 10) +
-    theme(
-      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 8),
-      axis.text.y = element_text(size = 8),
-      text = element_text(size = 8),
-      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
-      panel.grid.minor = element_blank()
-    )
-  print(p_dot)
-
-  cat("\n\n")
+  # CLR covariates used
+  clr_ref <- clr_covariates |> filter(reference == ref)
+  if (nrow(clr_ref) > 0) {
+    cat("**CLR covariates for DE adjustment:** ",
+        paste(clr_ref$celltype, collapse = ", "), "\n\n")
+  }
 }
 ```
 
@@ -234,12 +286,8 @@ ggplot(mean_across, aes(x = CellType, y = mean_prop, color = reference)) +
   scale_color_brewer(palette = "Set2") +
   labs(title = "Mean Cell Type Proportions by Reference",
        x = NULL, y = "Mean Proportion") +
-  theme_minimal(base_size = 10) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-    text = element_text(size = 8),
-    panel.grid.minor = element_blank()
-  )
+  theme_report() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
 ```
 
 ## Shannon Diversity Correlation
@@ -268,85 +316,459 @@ pheatmap(div_cor,
 
 ---
 
-# Differential Expression Summary {.tabset}
+# Dirichlet Regression {.tabset}
 
-## Significant Gene Counts
+```{r dirichlet-tabs, results='asis', fig.width=8, fig.height=5}
+if (nrow(dirichlet_coefs) > 0) {
+  for (ref in refs) {
+    cat("\n\n##", ref, "\n\n")
 
-```{r de-summary-table}
+    dir_ref <- dirichlet_coefs |> filter(reference == ref)
+    if (nrow(dir_ref) == 0) {
+      cat("No Dirichlet results available for this reference.\n\n")
+      next
+    }
+
+    dir_ref <- dir_ref |>
+      mutate(Feature_wrap = case_when(
+        Feature == "(Intercept)"         ~ "Intercept",
+        Feature == "HUHU"                ~ "HU",
+        Feature == "IRIR"                ~ "IR",
+        Feature == "KMPKMP"              ~ "KMP",
+        Feature == "HUHU:IRIR"           ~ "HU x IR",
+        Feature == "HUHU:KMPKMP"         ~ "HU x KMP",
+        Feature == "IRIR:KMPKMP"         ~ "IR x KMP",
+        Feature == "HUHU:IRIR:KMPKMP"    ~ "HU x IR x KMP",
+        TRUE                             ~ Feature
+      ))
+
+    p_dir <- dir_ref |>
+      filter(Feature != "(Intercept)") |>
+      ggplot(aes(y = Feature_wrap, x = Estimate,
+                 color = Pr...z.., shape = CellType)) +
+      geom_errorbarh(
+        aes(xmin = Estimate - StdError, xmax = Estimate + StdError),
+        height = 0.5, position = position_dodge(width = 0.7), linewidth = 0.5
+      ) +
+      geom_point(position = position_dodge(width = 0.7),
+                 size = 1.4, color = "#474747") +
+      geom_vline(xintercept = 0, linetype = "solid", linewidth = 0.5) +
+      binned_scale(
+        aesthetics = "color", scale_name = "stepsn",
+        palette = function(x) c("#FDE725FF", "#73D055FF", "#20A387FF", "#482677FF"),
+        breaks = c(0.005, 0.01, 0.05),
+        limits = c(0.0005, 0.5),
+        show.limits = TRUE, guide = "colorsteps"
+      ) +
+      guides(shape = guide_legend(ncol = 1)) +
+      labs(x = "Coefficient estimate", shape = "Cell Types", color = "p-value") +
+      theme_classic() +
+      theme(
+        text = element_text(size = 8),
+        axis.title.y = element_blank(),
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.4, "lines"),
+        panel.grid.major = element_line(colour = "grey", linewidth = 0.3),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "transparent", color = NA)
+      )
+    print(p_dir)
+    cat("\n\n")
+  }
+} else {
+  cat("No Dirichlet regression results found.\n\n")
+}
+```
+
+---
+
+# Differential Expression {.tabset .tabset-pills}
+
+```{r de-prep}
 main_effects <- c("HU_vs_NL_MAIN_EFFECT", "IR_vs_Sham_MAIN_EFFECT",
                   "KMP_vs_Sham_MAIN_EFFECT")
-
-sig_summary <- comparisons |>
-  group_by(reference, contrast) |>
-  summarise(
-    n_sig_adj   = sum(padj.adj <= alpha, na.rm = TRUE),
-    n_sig_unadj = sum(padj.unadj <= alpha, na.rm = TRUE),
-    n_adj_only  = sum(adj_only_sig, na.rm = TRUE),
-    n_unadj_only = sum(unadj_only_sig, na.rm = TRUE),
-    n_both      = sum(both_sig, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-knitr::kable(sig_summary, caption = "Significant genes per contrast and reference")
 ```
 
-## Volcano Plots (Main Effects)
+```{r de-tabs, results='asis', fig.width=12, fig.height=10}
+for (ref in refs) {
+  cat("\n\n##", ref, "{.tabset}\n\n")
 
-```{r volcano, fig.height=10, fig.width=12}
-volcano_data <- comparisons |>
-  filter(contrast %in% main_effects) |>
-  mutate(
-    sig_adj = padj.adj <= alpha,
-    neg_log10_p = -log10(pmax(padj.adj, 1e-300))
-  )
+  # ---- Volcano Plots ----
+  cat("\n\n### Volcano Plots\n\n")
 
-ggplot(volcano_data, aes(x = log2FoldChange.adj, y = neg_log10_p, color = sig_adj)) +
-  geom_point(size = 0.3, alpha = 0.5) +
-  geom_hline(yintercept = -log10(alpha), linetype = "dashed", color = "grey40") +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
-  scale_color_manual(values = c("FALSE" = "#999999", "TRUE" = "#ed9209"),
-                     labels = c("NS", "Sig")) +
-  facet_grid(contrast ~ reference) +
-  labs(title = "Volcano Plots: Main Effects (Composition-Adjusted)",
-       x = "log2 Fold Change", y = "-log10(padj)", color = NULL) +
-  theme_minimal(base_size = 10) +
-  theme(
-    strip.text = element_text(size = 7),
-    text = element_text(size = 8),
-    panel.grid.minor = element_blank()
-  )
+  for (model_label in c("Adjusted", "Unadjusted")) {
+    res_list <- if (model_label == "Adjusted") results_adj[[ref]] else results_unadj[[ref]]
+    if (is.null(res_list)) next
+
+    volcano_df <- lapply(main_effects, function(cname) {
+      df <- res_list[[cname]]
+      if (is.null(df)) return(NULL)
+      df |>
+        mutate(
+          contrast = cname,
+          neg_log10_p = -log10(pmax(padj, 1e-300)),
+          sig = ifelse(!is.na(padj) & padj <= alpha, "Sig", "NS")
+        )
+    }) |> bind_rows()
+
+    if (nrow(volcano_df) == 0) next
+
+    # Add gene names for labeling
+    volcano_df <- volcano_df |>
+      left_join(gene_map, by = "gene_id")
+
+    # Top 10 genes per contrast by significance
+    top_genes <- volcano_df |>
+      filter(sig == "Sig") |>
+      group_by(contrast) |>
+      slice_min(padj, n = 10, with_ties = FALSE) |>
+      ungroup()
+
+    volcano_df$contrast_label <- factor(
+      volcano_df$contrast,
+      levels = main_effects,
+      labels = contrast_labels[main_effects]
+    )
+    top_genes$contrast_label <- factor(
+      top_genes$contrast,
+      levels = main_effects,
+      labels = contrast_labels[main_effects]
+    )
+
+    p_volc <- ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log10_p,
+                                     color = sig)) +
+      geom_point_rast(size = 0.3, alpha = 0.5, dpi = 600) +
+      geom_hline(yintercept = -log10(alpha), linetype = "dashed", color = "grey40") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+      geom_text_repel(
+        data = top_genes,
+        aes(label = gene_name),
+        size = 3, segment.linetype = 2,
+        max.overlaps = 15, color = "black"
+      ) +
+      scale_color_manual(values = c("NS" = "#999999", "Sig" = "#ed9209")) +
+      facet_wrap(~ contrast_label, nrow = 1) +
+      labs(title = paste0(model_label, " Model -- ", ref),
+           x = "log2 Fold Change", y = "-log10(padj)", color = NULL) +
+      theme_report() +
+      theme(strip.text = element_text(size = 9))
+    print(p_volc)
+    cat("\n\n")
+  }
+
+  # ---- UpSet Plots ----
+  cat("\n\n### UpSet Plots\n\n")
+
+  res_adj_ref <- results_adj[[ref]]
+  if (!is.null(res_adj_ref)) {
+    # Build binary matrix: gene x contrast (sig up / sig down)
+    available_key <- intersect(key_contrasts, names(res_adj_ref))
+
+    if (length(available_key) >= 2) {
+      for (direction in c("up", "down")) {
+        upset_list <- lapply(available_key, function(cname) {
+          df <- res_adj_ref[[cname]]
+          if (is.null(df)) return(character(0))
+          if (direction == "up") {
+            df$gene_id[!is.na(df$padj) & df$padj <= alpha & df$log2FoldChange > 0]
+          } else {
+            df$gene_id[!is.na(df$padj) & df$padj <= alpha & df$log2FoldChange < 0]
+          }
+        })
+        names(upset_list) <- contrast_labels[available_key]
+
+        # Convert to binary data frame for ComplexUpset
+        all_genes <- unique(unlist(upset_list))
+        if (length(all_genes) < 2) {
+          cat(paste0("Fewer than 2 ", direction, "-regulated genes; skipping UpSet.\n\n"))
+          next
+        }
+
+        upset_df <- data.frame(gene_id = all_genes)
+        for (cname in names(upset_list)) {
+          upset_df[[cname]] <- upset_df$gene_id %in% upset_list[[cname]]
+        }
+
+        bar_color <- if (direction == "up") "lightblue" else "#d15469"
+        dir_label <- if (direction == "up") "Up-regulated" else "Down-regulated"
+
+        p_upset <- upset(
+          upset_df,
+          names(upset_list),
+          name = "Contrast",
+          min_size = 1,
+          base_annotations = list(
+            "Intersection size" = intersection_size(
+              bar_number_threshold = 1,
+              fill = bar_color
+            )
+          ),
+          themes = upset_default_themes(text = element_text(size = 8))
+        ) + ggtitle(paste0(dir_label, " DEGs (adjusted) -- ", ref))
+        print(p_upset)
+        cat("\n\n")
+      }
+    }
+  }
+
+  # ---- Adjustment Comparison ----
+  cat("\n\n### Adjustment Comparison\n\n")
+
+  comp_ref <- comparisons |> filter(reference == ref)
+
+  # Dot plot: padj adjusted vs unadjusted (key contrasts)
+  comp_key <- comp_ref |>
+    filter(contrast %in% key_contrasts) |>
+    mutate(
+      neg_log10_adj = -log10(pmax(padj.adj, 1e-300)),
+      neg_log10_unadj = -log10(pmax(padj.unadj, 1e-300)),
+      contrast_label = factor(contrast, levels = key_contrasts,
+                              labels = contrast_labels[key_contrasts])
+    )
+
+  if (nrow(comp_key) > 0) {
+    p_dot <- ggplot(comp_key, aes(x = neg_log10_unadj, y = neg_log10_adj)) +
+      geom_point_rast(size = 0.3, alpha = 0.3, color = "grey40", dpi = 600) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+      facet_wrap(~ contrast_label, scales = "free") +
+      labs(title = paste0("Adjustment Impact -- ", ref),
+           x = "-log10(padj) Unadjusted",
+           y = "-log10(padj) Adjusted") +
+      theme_report()
+    print(p_dot)
+    cat("\n\n")
+
+    # Summary table: DEG counts
+    adj_summary <- comp_key |>
+      group_by(contrast_label) |>
+      summarise(
+        n_sig_adj = sum(padj.adj <= alpha, na.rm = TRUE),
+        n_sig_unadj = sum(padj.unadj <= alpha, na.rm = TRUE),
+        n_adj_only = sum(adj_only_sig, na.rm = TRUE),
+        n_unadj_only = sum(unadj_only_sig, na.rm = TRUE),
+        n_both = sum(both_sig, na.rm = TRUE),
+        .groups = "drop"
+      )
+    print(knitr::kable(adj_summary, caption = paste0("DEG counts -- ", ref)))
+    cat("\n\n")
+
+    # Impact bar chart
+    impact <- adj_summary |>
+      pivot_longer(cols = c(n_adj_only, n_unadj_only, n_both),
+                   names_to = "category", values_to = "n_genes") |>
+      mutate(category = factor(category,
+                               levels = c("n_adj_only", "n_unadj_only", "n_both"),
+                               labels = c("Adjusted only", "Unadjusted only", "Both")))
+
+    set2_3 <- brewer.pal(3, "Set2")
+    p_impact <- ggplot(impact, aes(x = contrast_label, y = n_genes, fill = category)) +
+      geom_col(position = "dodge") +
+      scale_fill_manual(values = c("Adjusted only" = set2_3[1],
+                                   "Unadjusted only" = set2_3[2],
+                                   "Both" = set2_3[3])) +
+      labs(title = paste0("Impact of Composition Adjustment -- ", ref),
+           x = NULL, y = "Number of genes", fill = NULL) +
+      theme_report() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    print(p_impact)
+    cat("\n\n")
+  }
+
+  # ---- Full Sig Gene Counts ----
+  cat("\n\n### Full Sig Gene Counts\n\n")
+
+  full_summary <- comp_ref |>
+    group_by(contrast) |>
+    summarise(
+      n_sig_adj = sum(padj.adj <= alpha, na.rm = TRUE),
+      n_sig_unadj = sum(padj.unadj <= alpha, na.rm = TRUE),
+      n_adj_only = sum(adj_only_sig, na.rm = TRUE),
+      n_unadj_only = sum(unadj_only_sig, na.rm = TRUE),
+      n_both = sum(both_sig, na.rm = TRUE),
+      .groups = "drop"
+    )
+  print(knitr::kable(full_summary,
+                     caption = paste0("All 19 contrasts -- ", ref)))
+  cat("\n\n")
+}
 ```
 
-## Composition Adjustment Impact
+---
 
-```{r adj-impact, fig.height=6}
-set2_3 <- brewer.pal(3, "Set2")
+# Gene Set Enrichment {.tabset .tabset-pills}
 
-impact <- comparisons |>
-  group_by(reference, contrast) |>
-  summarise(
-    adj_only   = sum(adj_only_sig, na.rm = TRUE),
-    unadj_only = sum(unadj_only_sig, na.rm = TRUE),
-    both       = sum(both_sig, na.rm = TRUE),
-    .groups = "drop"
-  ) |>
-  pivot_longer(cols = c(adj_only, unadj_only, both),
-               names_to = "category", values_to = "n_genes")
+```{r gsea-tabs, results='asis', fig.width=12, fig.height=8}
+if (nrow(gsea_summaries) > 0) {
+  for (ref in refs) {
+    gsea_ref <- gsea_summaries |> filter(reference == ref)
+    if (nrow(gsea_ref) == 0) {
+      cat("\n\n##", ref, "\n\n")
+      cat("No GSEA results available for this reference.\n\n")
+      next
+    }
 
-ggplot(impact, aes(x = contrast, y = n_genes, fill = category)) +
-  geom_col(position = "dodge") +
-  facet_wrap(~ reference, ncol = 2) +
-  scale_fill_manual(values = c(adj_only = set2_3[1], unadj_only = set2_3[2],
-                               both = set2_3[3])) +
-  labs(title = "Impact of Composition Adjustment on DE Significance",
-       x = NULL, y = "Number of genes", fill = NULL) +
-  theme_minimal(base_size = 10) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
-    text = element_text(size = 8),
-    panel.grid.minor = element_blank()
-  )
+    cat("\n\n##", ref, "{.tabset}\n\n")
+
+    for (model_type in c("adjusted", "unadjusted")) {
+      gsea_model <- gsea_ref |> filter(model == model_type)
+      if (nrow(gsea_model) == 0) {
+        cat("\n\n###", tools::toTitleCase(model_type), "\n\n")
+        cat("No GSEA results for ", model_type, " model.\n\n")
+        next
+      }
+
+      cat("\n\n###", tools::toTitleCase(model_type), "{.tabset}\n\n")
+
+      # --- GO Biological Process dot plot ---
+      cat("\n\n#### GO Biological Process\n\n")
+
+      go_data <- gsea_model |>
+        filter(database == "GO_BP", p.adjust <= 0.05)
+
+      # Map contrast_slug to readable labels
+      slug_to_label <- contrast_labels
+      names(slug_to_label) <- gsub("[^A-Za-z0-9_]", "_", names(contrast_labels))
+
+      if (nrow(go_data) > 0) {
+        go_key <- go_data |>
+          filter(contrast_slug %in% gsub("[^A-Za-z0-9_]", "_", key_contrasts)) |>
+          mutate(
+            contrast_label = ifelse(
+              contrast_slug %in% names(slug_to_label),
+              slug_to_label[contrast_slug],
+              contrast_name
+            ),
+            Description = str_wrap(Description, width = 30)
+          ) |>
+          group_by(contrast_label) |>
+          slice_min(p.adjust, n = 5, with_ties = FALSE) |>
+          ungroup()
+
+        if (nrow(go_key) > 0) {
+          p_go <- ggplot(go_key, aes(x = NES, y = reorder(Description, NES),
+                                     color = p.adjust, size = setSize)) +
+            geom_point() +
+            scale_color_viridis_c(option = "magma", direction = -1) +
+            facet_wrap(~ contrast_label, scales = "free_y") +
+            labs(title = paste0("GO-BP GSEA -- ", ref, " (", model_type, ")"),
+                 x = "NES", y = NULL, color = "p.adjust", size = "Gene set\nsize") +
+            theme_report() +
+            theme(
+              axis.text.y = element_text(size = 7),
+              strip.text = element_text(size = 9),
+              panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5)
+            )
+          print(p_go)
+        } else {
+          cat("No significant GO-BP results for key contrasts.\n\n")
+        }
+      } else {
+        cat("No significant GO-BP results (padj <= 0.05).\n\n")
+      }
+      cat("\n\n")
+
+      # --- KEGG dot plot ---
+      cat("\n\n#### KEGG Pathways\n\n")
+
+      kegg_data <- gsea_model |>
+        filter(database == "KEGG", p.adjust <= 0.05)
+
+      if (nrow(kegg_data) > 0) {
+        kegg_key <- kegg_data |>
+          filter(contrast_slug %in% gsub("[^A-Za-z0-9_]", "_", key_contrasts)) |>
+          mutate(
+            contrast_label = ifelse(
+              contrast_slug %in% names(slug_to_label),
+              slug_to_label[contrast_slug],
+              contrast_name
+            ),
+            Description = str_wrap(Description, width = 30)
+          ) |>
+          group_by(contrast_label) |>
+          slice_min(p.adjust, n = 5, with_ties = FALSE) |>
+          ungroup()
+
+        if (nrow(kegg_key) > 0) {
+          p_kegg <- ggplot(kegg_key, aes(x = NES, y = reorder(Description, NES),
+                                          color = p.adjust, size = setSize)) +
+            geom_point() +
+            scale_color_viridis_c(option = "magma", direction = -1) +
+            facet_wrap(~ contrast_label, scales = "free_y") +
+            labs(title = paste0("KEGG GSEA -- ", ref, " (", model_type, ")"),
+                 x = "NES", y = NULL, color = "p.adjust", size = "Gene set\nsize") +
+            theme_report() +
+            theme(
+              axis.text.y = element_text(size = 7),
+              strip.text = element_text(size = 9),
+              panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5)
+            )
+          print(p_kegg)
+        } else {
+          cat("No significant KEGG results for key contrasts.\n\n")
+        }
+      } else {
+        cat("No significant KEGG results (padj <= 0.05).\n\n")
+      }
+      cat("\n\n")
+
+      # --- Full table ---
+      cat("\n\n#### Full Table\n\n")
+
+      sig_all <- gsea_model |> filter(p.adjust <= 0.05)
+      if (nrow(sig_all) > 0) {
+        display_tbl <- sig_all |>
+          select(database, contrast_name, ID, Description, NES, p.adjust, setSize) |>
+          arrange(database, contrast_name, p.adjust)
+        print(knitr::kable(display_tbl, digits = 4,
+                           caption = paste0("Significant pathways -- ",
+                                            ref, " (", model_type, ")")))
+      } else {
+        cat("No significant pathways (padj <= 0.05).\n\n")
+      }
+      cat("\n\n")
+    }
+  }
+} else {
+  cat("\n\nNo GSEA results available.\n\n")
+}
 ```
+
+---
+
+# Methods Summary
+
+## CLR Covariate Selection
+
+The composition-adjusted DESeq2 model includes CLR-transformed proportions
+of the **top 2 most abundant cell types** (by mean proportion across all samples)
+as covariates. This limits the number of added covariates to avoid overfitting,
+particularly for references with many cell types.
+
+```{r clr-table}
+if (nrow(clr_covariates) > 0) {
+  knitr::kable(clr_covariates,
+               caption = "Top-2 CLR covariates per reference")
+}
+```
+
+## GSEA Ranking Metric
+
+Genes are ranked by **signed -log10(p-value)**: `-log10(pvalue) * sign(log2FoldChange)`.
+This weights both statistical significance and effect direction, matching the
+approach in [Gural et al. 2025](https://doi.org/10.1371/journal.pgen.1011807).
+
+GSEA was run using clusterProfiler's `gseGO()` (GO Biological Process, ENSEMBL IDs)
+and `gseKEGG()` (KEGG pathways, ENTREZID). Parameters: minGSSize=10, maxGSSize=500,
+BH adjustment, eps=0.
+
+## DE Model Formulas
+
+- **Adjusted:** `~ 0 + group + clr.CellType1 + clr.CellType2`
+- **Unadjusted:** `~ 0 + group`
+
+Both use cell-means parameterization with 19 numeric contrast vectors
+(10 pairwise, 3 main effects, 3 marginal means, 3 two-way interactions).
+LFC shrinkage via ashr.
 
 ---
 

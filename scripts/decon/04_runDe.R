@@ -22,6 +22,8 @@
 #   - data/processed/models/{ref_name}_results_adjusted.rds
 #   - data/processed/models/{ref_name}_results_unadjusted.rds
 #   - data/processed/models/{ref_name}_de_comparison.csv
+#   - data/processed/models/{ref_name}_clr_covariates.csv
+#   - data/processed/models/{ref_name}_contrast_index.csv
 
 library(jsonlite)
 library(dplyr)
@@ -79,11 +81,17 @@ comp_wide <- comp_wide / row_sums
 comp_clr <- as.data.frame(compositions::clr(as.matrix(comp_wide)))
 colnames(comp_clr) <- paste0("clr.", make.names(colnames(comp_wide)))
 
-# Drop last CLR column (alphabetically) to avoid linear dependence
-clr_cols <- sort(colnames(comp_clr))
-drop_col <- clr_cols[length(clr_cols)]
-comp_clr[[drop_col]] <- NULL
-clr_keep <- setdiff(clr_cols, drop_col)
+# Select top 2 most abundant cell types as CLR covariates
+mean_props <- colMeans(comp_wide)
+top2_types <- names(sort(mean_props, decreasing = TRUE))[1:2]
+clr_keep <- paste0("clr.", make.names(top2_types))
+comp_clr <- comp_clr[, clr_keep, drop = FALSE]
+
+write.csv(
+  data.frame(reference = ref_name, celltype = top2_types, clr_name = clr_keep),
+  file.path(out_dir, paste0(ref_name, "_clr_covariates.csv")),
+  row.names = FALSE
+)
 
 # Merge CLR columns into coldata (match row order)
 coldata <- cbind(coldata, comp_clr[rownames(coldata), , drop = FALSE])
@@ -282,4 +290,15 @@ rownames(comparison) <- NULL
 
 write.csv(comparison,
           file.path(out_dir, paste0(ref_name, "_de_comparison.csv")),
+          row.names = FALSE)
+
+# ---- Section 7: Write contrast index for GSEA jobs ----
+
+contrast_index <- data.frame(
+  index = seq_along(names(contrast_weights)),
+  name = names(contrast_weights),
+  slug = gsub("[^A-Za-z0-9_]", "_", names(contrast_weights))
+)
+write.csv(contrast_index,
+          file.path(out_dir, paste0(ref_name, "_contrast_index.csv")),
           row.names = FALSE)

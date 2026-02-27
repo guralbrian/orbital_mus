@@ -1,0 +1,13 @@
+name: orbital_mus_gsea
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base>=4.4.0,<4.5
+  - r-tidyverse
+  - r-jsonlite
+  - bioconductor-clusterprofiler
+  - bioconductor-org.mm.eg.db
+  - bioconductor-dose
+  - bioconductor-enrichplot
+  - compilers
