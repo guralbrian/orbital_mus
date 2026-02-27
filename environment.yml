@@ -14,4 +14,6 @@ dependencies:
   - r-rmarkdown
   - r-pheatmap
   - bioconductor-deseq2
+  - r-kableextra
+  - r-gt
   - compilers

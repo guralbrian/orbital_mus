@@ -20,17 +20,19 @@ knitr::opts_chunk$set(
 ```
 
 ```{r libraries}
+library(DESeq2)
 library(ggplot2)
 library(dplyr)
 library(tidyr)
 library(stringr)
 library(RColorBrewer)
-library(pheatmap)
 library(jsonlite)
 library(ggrepel)
 library(ggrastr)
 library(patchwork)
 library(ComplexUpset)
+library(kableExtra)
+library(gt)
 ```
 
 ```{r load-data}
@@ -40,6 +42,9 @@ proc_dir <- file.path(proj_root, cfg$processed_dir)
 
 refs <- cfg$decon_references
 alpha <- cfg$de_alpha
+
+# B6J-matched references for DE and GSEA
+b6j_refs <- c("bulk_decon", "mortazavi_b6j")
 
 compositions <- lapply(refs, function(ref) {
   read.csv(file.path(proc_dir, "decon", paste0(ref, "_compositions.csv"))) |>
@@ -71,7 +76,7 @@ contrast_indices <- lapply(refs, function(ref) {
   if (file.exists(f)) read.csv(f) |> mutate(reference = ref) else NULL
 }) |> bind_rows()
 
-# Load DE results RDS for volcanos and UpSet (need per-contrast data frames)
+# Load DE results RDS for volcanos and UpSet
 results_adj <- lapply(refs, function(ref) {
   f <- file.path(proc_dir, "models", paste0(ref, "_results_adjusted.rds"))
   if (file.exists(f)) readRDS(f) else NULL
@@ -87,18 +92,80 @@ names(results_unadj) <- refs
 # Gene name map
 gene_map <- read.csv(file.path(proc_dir, "heart_gene_names.csv"))
 
-# Load GSEA summaries (may not exist for all refs/models during troubleshooting)
+# Load GSEA summaries
 gsea_summaries <- lapply(refs, function(ref) {
   lapply(c("adjusted", "unadjusted"), function(model) {
     f <- file.path(proc_dir, "gsea", paste0(ref, "_", model, "_combined.csv"))
     if (file.exists(f)) read.csv(f) else NULL
   }) |> bind_rows()
 }) |> bind_rows()
+
+# Load DDS objects for CLR covariate significance
+dds_adj_list <- lapply(b6j_refs, function(ref) {
+  f <- file.path(proc_dir, "models", paste0(ref, "_dds_adjusted.rds"))
+  if (file.exists(f)) readRDS(f) else NULL
+})
+names(dds_adj_list) <- b6j_refs
+
+# ---- Global rename: bulk_decon -> Rau2025 ----
+rename_ref <- function(x) gsub("bulk_decon", "Rau2025", x)
+
+compositions$reference     <- rename_ref(compositions$reference)
+comparisons$reference      <- rename_ref(comparisons$reference)
+markers$reference          <- rename_ref(markers$reference)
+clr_covariates$reference   <- rename_ref(clr_covariates$reference)
+dirichlet_coefs$reference  <- rename_ref(dirichlet_coefs$reference)
+contrast_indices$reference <- rename_ref(contrast_indices$reference)
+gsea_summaries$reference   <- rename_ref(gsea_summaries$reference)
+refs <- rename_ref(refs)
+b6j_refs <- rename_ref(b6j_refs)
+names(results_adj)   <- rename_ref(names(results_adj))
+names(results_unadj) <- rename_ref(names(results_unadj))
+names(dds_adj_list)  <- rename_ref(names(dds_adj_list))
+
+# ---- Extract per-gene CLR covariate significance ----
+clr_sig_list <- list()
+for (ref in b6j_refs) {
+  dds <- dds_adj_list[[ref]]
+  if (is.null(dds)) next
+
+  clr_ref <- clr_covariates |> filter(reference == ref)
+  clr_names <- clr_ref$clr_name
+  ct_names <- clr_ref$celltype
+
+  rn <- resultsNames(dds)
+  clr_coefs <- intersect(clr_names, rn)
+  if (length(clr_coefs) != 2) next
+
+  res1 <- as.data.frame(results(dds, name = clr_coefs[1]))
+  res2 <- as.data.frame(results(dds, name = clr_coefs[2]))
+
+  ct1_label <- paste0(ct_names[clr_names == clr_coefs[1]], " only")
+  ct2_label <- paste0(ct_names[clr_names == clr_coefs[2]], " only")
+
+  clr_sig_list[[ref]] <- data.frame(
+    gene_id = rownames(res1),
+    reference = ref,
+    sig_ct1 = !is.na(res1$padj) & res1$padj <= alpha,
+    sig_ct2 = !is.na(res2$padj) & res2$padj <= alpha
+  ) |> mutate(
+    ct_assoc = case_when(
+      sig_ct1 & sig_ct2 ~ "Both cell types",
+      sig_ct1 ~ ct1_label,
+      sig_ct2 ~ ct2_label,
+      TRUE ~ "Neither"
+    )
+  ) |> select(gene_id, reference, ct_assoc)
+}
+
+clr_sig_all <- bind_rows(clr_sig_list)
+comparisons <- comparisons |>
+  left_join(clr_sig_all, by = c("gene_id", "reference"))
 ```
 
 ```{r palettes}
 # Group palette
-group_pal <- brewer.pal(8, "Set2")
+group_pal <- brewer.pal(8, "Dark2")
 names(group_pal) <- cfg$heart_group_order
 
 # Key contrasts for focused plots
@@ -107,14 +174,17 @@ key_contrasts <- c(
   "Interaction_KMP_x_HU", "Interaction_KMP_x_IR", "Interaction_HU_x_IR"
 )
 
-# Readable contrast labels
+# Readable contrast labels (expanded to include pairwise)
 contrast_labels <- c(
-  "HU_vs_NL_MAIN_EFFECT" = "HU vs NL",
-  "IR_vs_Sham_MAIN_EFFECT" = "IR vs Sham",
+  "HU_vs_NL_MAIN_EFFECT"    = "HU vs NL",
+  "IR_vs_Sham_MAIN_EFFECT"  = "IR vs Sham",
   "KMP_vs_Sham_MAIN_EFFECT" = "KMP vs Ctrl",
-  "Interaction_KMP_x_HU" = "KMP x HU",
-  "Interaction_KMP_x_IR" = "KMP x IR",
-  "Interaction_HU_x_IR" = "HU x IR"
+  "Interaction_KMP_x_HU"    = "KMP x HU",
+  "Interaction_KMP_x_IR"    = "KMP x IR",
+  "Interaction_HU_x_IR"     = "HU x IR",
+  "HU_vs_Ctrl"              = "HU vs Ctrl (pairwise)",
+  "IR_vs_Ctrl"              = "IR vs Ctrl (pairwise)",
+  "KMP_vs_Ctrl"             = "KMP vs Ctrl (pairwise)"
 )
 
 # Consistent cell type colors across references via family mapping
@@ -148,50 +218,176 @@ for (fam in names(celltype_families)) {
   }
 }
 
+# Assign each cell type to a family name for the reference comparison
+assign_family <- function(ct) {
+  for (fam in names(celltype_families)) {
+    if (any(sapply(celltype_families[[fam]], function(pat) grepl(pat, ct, ignore.case = TRUE)))) {
+      return(fam)
+    }
+  }
+  return("other")
+}
+
 # Base theme for all plots
 theme_report <- function(base_size = 10) {
   theme_minimal(base_size = base_size) +
     theme(
-      text = element_text(size = 8),
+      text = element_text(size = 9),
       panel.grid.minor = element_blank(),
       plot.background = element_rect(fill = "transparent", color = NA),
       legend.background = element_rect(fill = "transparent")
+    )
+}
+
+# Helper for styled kable tables
+styled_kable <- function(df, ...) {
+  knitr::kable(df, ...) |>
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width = FALSE, font_size = 12
     )
 }
 ```
 
 # Introduction
 
-This report summarizes cell type deconvolution, differential expression, and
-gene set enrichment analysis of ~80 mouse heart samples from an orbital
-unloading experiment (2x2x2 factorial: HU/NL x IR/Sham x KMP/Ctrl).
+## Biological Question
 
-**Single-cell references:**
+Hindlimb unloading (HU), ionizing radiation (IR), and the countermeasure KMP
+model distinct spaceflight stressors on the murine heart. The core question:
+**which expression changes are intrinsic transcriptional responses vs. secondary
+consequences of cell type composition shifts?**
 
-- **bulk_decon** -- 4 cell types from C57BL/6J left ventricle
-  ([Gural et al. 2025](https://doi.org/10.1371/journal.pgen.1011807))
-- **mortazavi_general** -- 8 major cell types across all strains
-  ([IGVF Mortazavi lab](https://pubmed.ncbi.nlm.nih.gov/41478285/))
-- **mortazavi_celltype** -- 14 granular cell types from the same atlas
-- **mortazavi_b6j** -- 8 cell types restricted to C57BL/6J samples
+We use two independent scRNA-seq reference datasets for deconvolution:
 
-**Analytical approach:**
+- **Rau2025** ([Gural et al. 2025](https://doi.org/10.1371/journal.pgen.1011807)):
+  4 major cell types from C57BL/6J mouse hearts
+- **Mortazavi** (IGVF Mortazavi lab): multi-strain mouse heart atlas with three
+  granularity levels -- **general** (8 types), **celltype** (14 types), and
+  **b6j** (8 B6J-specific types)
 
-1. MuSiC deconvolution with 15 markers per cell type
-2. CLR-transformed top-2 cell type covariates for composition-adjusted DE
-3. DESeq2 cell-means model (~ 0 + group) with ashr shrinkage, 19 contrasts
-4. Dirichlet regression on compositions (3-factor design)
-5. GSEA (GO-BP + KEGG) on ranked gene lists
+We select Mortazavi general as the primary non-Rau reference because it offers
+richer diversity in expression profiles (8 cell types vs. 4 in Rau2025) without
+the over-splitting of 14 types in the celltype version, which risks poorly
+resolved signatures.
+
+## Experimental Design
+
+```{r design-table}
+design_df <- data.frame(
+  Factor = c("Loading", "Radiation", "Countermeasure"),
+  Levels = c("HU / NL", "IR / Sham", "KMP / Ctrl"),
+  Rationale = c(
+    "Simulates microgravity-induced cardiac unloading",
+    "Mimics space radiation exposure",
+    "Tests a pharmacological countermeasure"
+  )
+)
+styled_kable(design_df, caption = "2x2x2 factorial design (~80 samples, 8 groups, ~10/group)")
+```
+
+## Analytical Strategy
+
+1. **MuSiC deconvolution** -- estimate cell type proportions from bulk RNA-seq
+   using several single-cell/nucleus reference panels (15 markers per cell type),
+   then select one primary reference for downstream analysis
+2. **Dirichlet regression** -- test whether treatments shift cell type
+   composition (`CellTypes ~ HU * IR * KMP`)
+3. **CLR-adjusted DE** -- include CLR-transformed proportions of the top 2 most
+   abundant cell types as additive covariates in DESeq2 (full interaction model
+   for treatments: `HU * IR * KMP`). Compare how gene significance changes
+   with and without cell type covariates
+4. **GSEA** -- identify enriched pathways in adjusted ranked gene lists for each
+   treatment contrast and interaction, focusing on the most-changed genes
 
 Source: [github.com/guralbrian/orbital_mus](https://github.com/guralbrian/orbital_mus)
 
 ---
 
-# Cell Type Compositions {.tabset}
+# Methods Overview
 
-```{r comp-tabs, results='asis', fig.width=10, fig.height=7}
+## CLR Covariate Selection
+
+The composition-adjusted DESeq2 model includes CLR-transformed proportions
+of the **top 2 most abundant cell types** (by mean proportion across all samples)
+as covariates. This limits the number of added covariates to avoid overfitting,
+particularly for references with many cell types.
+
+```{r clr-table}
+if (nrow(clr_covariates) > 0) {
+  styled_kable(
+    clr_covariates |> select(reference, celltype),
+    caption = "Top-2 CLR covariates per reference"
+  )
+}
+```
+
+## Model Formulas
+
+- **Unadjusted DE:** `~ 0 + HU * IR * KMP`
+- **Adjusted DE:** `~ 0 + group + clr.CellType1 + clr.CellType2`
+- **Dirichlet regression:** `CellTypes ~ HU * IR * KMP`
+
+Both DE models use cell-means parameterization with 19 numeric contrast vectors
+(10 pairwise, 3 main effects, 3 marginal means, 3 two-way interactions).
+LFC shrinkage via ashr.
+
+## GSEA Ranking Metric
+
+Genes are ranked by **signed -log10(p-value)**: `-log10(pvalue) * sign(log2FoldChange)`.
+This weights both statistical significance and effect direction, matching the
+approach in [Gural et al. 2025](https://doi.org/10.1371/journal.pgen.1011807).
+
+GSEA was run using clusterProfiler's `gseGO()` (GO Biological Process, ENSEMBL IDs)
+and `gseKEGG()` (KEGG pathways, ENTREZID). Parameters: minGSSize=10, maxGSSize=500,
+BH adjustment, eps=0.
+
+---
+
+# Reference Panel
+
+```{r ref-panel-table}
+ref_sources <- data.frame(
+  reference = c("Rau2025", "mortazavi_general", "mortazavi_celltype", "mortazavi_b6j"),
+  Source = c(
+    "Gural et al. 2025",
+    "IGVF Mortazavi lab",
+    "IGVF Mortazavi lab",
+    "IGVF Mortazavi lab"
+  ),
+  Strain = c("C57BL/6J", "Multi-strain", "Multi-strain", "C57BL/6J"),
+  Granularity = c("4 major types", "8 general types", "14 granular types", "8 B6J types")
+)
+
+marker_summary <- markers |>
+  group_by(reference) |>
+  summarise(
+    n_celltypes = n_distinct(celltype),
+    n_markers = n(),
+    .groups = "drop"
+  )
+
+ref_table <- ref_sources |>
+  left_join(marker_summary, by = "reference") |>
+  mutate(
+    Role = ifelse(reference %in% b6j_refs,
+                  "Composition + DE + GSEA",
+                  "Composition + Dirichlet only")
+  ) |>
+  dplyr::rename(Reference = reference, `N Cell Types` = n_celltypes, `N Markers` = n_markers)
+
+styled_kable(ref_table, caption = "Single-cell/nucleus reference panels")
+```
+
+---
+
+# What Are the Cell Type Compositions? {.tabset}
+
+## Stacked Bars {.tabset .tabset-pills}
+
+```{r comp-stacked, results='asis', fig.width=14, fig.height=9}
 for (ref in refs) {
-  cat("\n\n##", ref, "\n\n")
+  cat("\n\n###", ref, "\n\n")
 
   comp_ref <- compositions |> filter(reference == ref)
 
@@ -201,7 +397,6 @@ for (ref in refs) {
     arrange(desc(mean_prop)) |>
     pull(CellType)
 
-  # Use family-consistent palette, ordered by abundance
   ct_pal <- celltype_pal[cell_order]
 
   sample_order <- comp_ref |>
@@ -218,117 +413,112 @@ for (ref in refs) {
       CellType = factor(CellType, levels = cell_order)
     )
 
-  # Stacked bar chart
   p_bar <- ggplot(comp_ref, aes(x = sample_id, y = Prop, fill = CellType)) +
     geom_col(color = "black", linewidth = 0.1) +
-    facet_wrap(~ group, scales = "free_x") +
+    facet_wrap(~ group, ncol = 4, scales = "free_x") +
     scale_fill_manual(values = ct_pal,
                       labels = function(x) str_wrap(x, width = 15)) +
-    labs(title = paste0("Cell Type Proportions -- ", ref),
-         x = NULL, y = "Proportion", fill = "Cell Type") +
+    labs(x = NULL, y = "Proportion", fill = "Cell Type") +
     theme_report() +
     theme(
-      axis.text.x = element_text(angle = 90, hjust = 1, size = 4),
-      strip.text = element_text(size = 7)
+      axis.text.x = element_text(angle = 90, hjust = 1, size = 6),
+      strip.text = element_text(size = 9)
     )
   print(p_bar)
   cat("\n\n")
+}
+```
 
-  # Mean bars + jitter
-  p_mean <- ggplot(comp_ref, aes(x = group, y = Prop, fill = group)) +
-    geom_bar(stat = "summary", fun = mean, width = 0.7,
-             color = "black", linewidth = 0.2) +
-    geom_jitter(width = 0.15, alpha = 0.5, size = 1) +
+## Boxplots by Group {.tabset .tabset-pills}
+
+```{r comp-boxplots, results='asis', fig.width=12, fig.height=8}
+for (ref in refs) {
+  cat("\n\n###", ref, "\n\n")
+
+  comp_ref <- compositions |>
+    filter(reference == ref) |>
+    mutate(
+      group = factor(group, levels = cfg$heart_group_order),
+      Pct = Prop * 100
+    )
+
+  p_box <- ggplot(comp_ref, aes(x = group, y = Pct, fill = group)) +
+    geom_boxplot(outlier.size = 0.8, linewidth = 0.3) +
+    geom_jitter(width = 0.15, alpha = 0.4, size = 0.8) +
     facet_wrap(~ CellType, scales = "free_y") +
     scale_fill_manual(values = group_pal) +
-    labs(title = paste0("Mean Proportions by Group -- ", ref),
-         x = NULL, y = "Proportion", fill = "Group") +
+    labs(x = NULL, y = "Proportion (%)") +
     theme_report() +
     theme(
-      axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
-      legend.position = "none"
-    )
-  print(p_mean)
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      legend.position = "bottom"
+    ) +
+    guides(fill = guide_legend(nrow = 2))
+  print(p_box)
   cat("\n\n")
 
-  # Mean proportions table
-  mean_tbl <- comp_ref |>
+  # Mean proportions table (percent)
+  mean_tbl <- compositions |>
+    filter(reference == ref) |>
+    mutate(Pct = Prop * 100) |>
     group_by(group, CellType) |>
-    summarise(mean_prop = mean(Prop, na.rm = TRUE), .groups = "drop") |>
-    pivot_wider(names_from = CellType, values_from = mean_prop)
-  print(knitr::kable(mean_tbl, digits = 4,
-                     caption = paste0("Mean proportions -- ", ref)))
+    summarise(mean_pct = mean(Pct, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = CellType, values_from = mean_pct)
+  print(styled_kable(mean_tbl, digits = 1,
+                     caption = paste0("Mean proportions (%) -- ", ref)))
   cat("\n\n")
-
-  # CLR covariates used
-  clr_ref <- clr_covariates |> filter(reference == ref)
-  if (nrow(clr_ref) > 0) {
-    cat("**CLR covariates for DE adjustment:** ",
-        paste(clr_ref$celltype, collapse = ", "), "\n\n")
-  }
 }
 ```
 
----
+## Reference Comparison
 
-# Reference Comparison
+```{r ref-comparison, fig.width=8, fig.height=5}
+# Map cell types to families and compare across references
+comp_family <- compositions |>
+  mutate(
+    family = sapply(CellType, assign_family),
+    Pct = Prop * 100
+  ) |>
+  group_by(reference, sample_id, family) |>
+  summarise(Pct = sum(Pct, na.rm = TRUE), .groups = "drop")
 
-## Mean Proportions Across References
-
-```{r ref-dotplot, fig.height=8}
-mean_across <- compositions |>
-  group_by(reference, CellType) |>
-  summarise(mean_prop = mean(Prop, na.rm = TRUE), .groups = "drop")
-
-ggplot(mean_across, aes(x = CellType, y = mean_prop, color = reference)) +
-  geom_point(size = 3, position = position_dodge(width = 0.5)) +
-  facet_wrap(~ reference, scales = "free_x", ncol = 1) +
-  scale_color_brewer(palette = "Set2") +
-  labs(title = "Mean Cell Type Proportions by Reference",
-       x = NULL, y = "Mean Proportion") +
+ggplot(comp_family, aes(x = family, y = Pct, fill = reference)) +
+  geom_boxplot(outlier.size = 0.5, linewidth = 0.3,
+               position = position_dodge(width = 0.8)) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(x = NULL, y = "Proportion (%)", fill = "Reference") +
   theme_report() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 9))
 ```
 
-## Shannon Diversity Correlation
-
-```{r shannon-heatmap, fig.height=5, fig.width=6}
-shannon <- function(p) {
-  p <- p[p > 0]
-  -sum(p * log(p))
-}
-
-diversity <- compositions |>
+```{r comp-dynamic-summary, results='asis'}
+# Dynamic summary sentence
+cm_range <- compositions |>
+  mutate(family = sapply(CellType, assign_family)) |>
+  filter(family == "cardiomyocyte") |>
   group_by(reference, sample_id) |>
-  summarise(H = shannon(Prop), .groups = "drop") |>
-  pivot_wider(names_from = reference, values_from = H)
+  summarise(cm_prop = sum(Prop, na.rm = TRUE), .groups = "drop") |>
+  group_by(reference) |>
+  summarise(mean_cm = mean(cm_prop), .groups = "drop")
 
-div_mat <- as.matrix(diversity[, -1])
-rownames(div_mat) <- diversity$sample_id
+cm_lo <- round(min(cm_range$mean_cm) * 100, 0)
+cm_hi <- round(max(cm_range$mean_cm) * 100, 0)
 
-div_cor <- cor(div_mat, use = "pairwise.complete.obs")
-
-pheatmap(div_cor,
-         display_numbers = TRUE, number_format = "%.3f",
-         main = "Shannon Diversity Correlation Across References",
-         fontsize = 10)
+cat(paste0(
+  "Across all references, cardiomyocyte-family cells dominate (",
+  cm_lo, "--", cm_hi, "%), consistent with left ventricular tissue.\n\n"
+))
 ```
 
 ---
 
-# Dirichlet Regression {.tabset}
+# Do Treatments Shift Composition?
 
-```{r dirichlet-tabs, results='asis', fig.width=8, fig.height=5}
+```{r dirichlet-section, results='asis', fig.width=10, fig.height=8}
 if (nrow(dirichlet_coefs) > 0) {
-  for (ref in refs) {
-    cat("\n\n##", ref, "\n\n")
+  dir_ref <- dirichlet_coefs |> filter(reference == "mortazavi_general")
 
-    dir_ref <- dirichlet_coefs |> filter(reference == ref)
-    if (nrow(dir_ref) == 0) {
-      cat("No Dirichlet results available for this reference.\n\n")
-      next
-    }
-
+  if (nrow(dir_ref) > 0) {
     dir_ref <- dir_ref |>
       mutate(Feature_wrap = case_when(
         Feature == "(Intercept)"         ~ "Intercept",
@@ -342,16 +532,15 @@ if (nrow(dirichlet_coefs) > 0) {
         TRUE                             ~ Feature
       ))
 
-    p_dir <- dir_ref |>
-      filter(Feature != "(Intercept)") |>
-      ggplot(aes(y = Feature_wrap, x = Estimate,
-                 color = Pr...z.., shape = CellType)) +
+    dir_plot <- dir_ref |> filter(Feature != "(Intercept)")
+
+    p_dir <- ggplot(dir_plot, aes(y = Feature_wrap, x = Estimate,
+                                   color = Pr...z..)) +
       geom_errorbarh(
         aes(xmin = Estimate - StdError, xmax = Estimate + StdError),
-        height = 0.5, position = position_dodge(width = 0.7), linewidth = 0.5
+        height = 0.3, linewidth = 0.5
       ) +
-      geom_point(position = position_dodge(width = 0.7),
-                 size = 1.4, color = "#474747") +
+      geom_point(size = 1.6, color = "#474747") +
       geom_vline(xintercept = 0, linetype = "solid", linewidth = 0.5) +
       binned_scale(
         aesthetics = "color", scale_name = "stepsn",
@@ -360,20 +549,29 @@ if (nrow(dirichlet_coefs) > 0) {
         limits = c(0.0005, 0.5),
         show.limits = TRUE, guide = "colorsteps"
       ) +
-      guides(shape = guide_legend(ncol = 1)) +
-      labs(x = "Coefficient estimate", shape = "Cell Types", color = "p-value") +
-      theme_classic() +
+      facet_wrap(~ CellType, ncol = 3, scales = "free_x") +
+      labs(x = "Coefficient estimate", y = NULL, color = "p-value") +
+      theme_report() +
       theme(
-        text = element_text(size = 8),
-        axis.title.y = element_blank(),
-        legend.text = element_text(size = 6),
-        legend.key.size = unit(0.4, "lines"),
-        panel.grid.major = element_line(colour = "grey", linewidth = 0.3),
-        panel.grid.minor = element_blank(),
-        plot.background = element_rect(fill = "transparent", color = NA)
+        strip.text = element_text(size = 8),
+        panel.grid.major = element_line(colour = "grey90", linewidth = 0.3)
       )
     print(p_dir)
     cat("\n\n")
+
+    # Significance summary table
+    sig_dir <- dir_plot |>
+      filter(Pr...z.. < 0.05) |>
+      select(CellType, Feature_wrap, Estimate, StdError, Pr...z..) |>
+      arrange(Pr...z..)
+    if (nrow(sig_dir) > 0) {
+      print(styled_kable(sig_dir, digits = 4,
+                         caption = "Significant coefficients (p < 0.05) -- mortazavi_general"))
+    } else {
+      cat("No coefficients with p < 0.05.\n\n")
+    }
+  } else {
+    cat("No Dirichlet results available for mortazavi_general.\n\n")
   }
 } else {
   cat("No Dirichlet regression results found.\n\n")
@@ -382,212 +580,358 @@ if (nrow(dirichlet_coefs) > 0) {
 
 ---
 
-# Differential Expression {.tabset .tabset-pills}
+# How Does Composition Adjustment Affect DE? {.tabset .tabset-pills}
 
-```{r de-prep}
-main_effects <- c("HU_vs_NL_MAIN_EFFECT", "IR_vs_Sham_MAIN_EFFECT",
-                  "KMP_vs_Sham_MAIN_EFFECT")
-```
+We've previously shown that compositional changes in bulk tissue can inflate
+false-positive DEGs. To address this, we've included CLR-transformed cell type
+proportions as covariates in DESeq2. Points above the diagonal were more
+significant after adjustment (signal was masked by composition); points below
+were less significant (signal was inflated by composition). Dots are colored
+by whether the gene's expression is significantly associated with the CLR
+covariate cell types.
 
-```{r de-tabs, results='asis', fig.width=12, fig.height=10}
-for (ref in refs) {
-  cat("\n\n##", ref, "{.tabset}\n\n")
+**Shown for strain-matched (B6J) references only.**
 
-  # ---- Volcano Plots ----
-  cat("\n\n### Volcano Plots\n\n")
-
-  for (model_label in c("Adjusted", "Unadjusted")) {
-    res_list <- if (model_label == "Adjusted") results_adj[[ref]] else results_unadj[[ref]]
-    if (is.null(res_list)) next
-
-    volcano_df <- lapply(main_effects, function(cname) {
-      df <- res_list[[cname]]
-      if (is.null(df)) return(NULL)
-      df |>
-        mutate(
-          contrast = cname,
-          neg_log10_p = -log10(pmax(padj, 1e-300)),
-          sig = ifelse(!is.na(padj) & padj <= alpha, "Sig", "NS")
-        )
-    }) |> bind_rows()
-
-    if (nrow(volcano_df) == 0) next
-
-    # Add gene names for labeling
-    volcano_df <- volcano_df |>
-      left_join(gene_map, by = "gene_id")
-
-    # Top 10 genes per contrast by significance
-    top_genes <- volcano_df |>
-      filter(sig == "Sig") |>
-      group_by(contrast) |>
-      slice_min(padj, n = 10, with_ties = FALSE) |>
-      ungroup()
-
-    volcano_df$contrast_label <- factor(
-      volcano_df$contrast,
-      levels = main_effects,
-      labels = contrast_labels[main_effects]
-    )
-    top_genes$contrast_label <- factor(
-      top_genes$contrast,
-      levels = main_effects,
-      labels = contrast_labels[main_effects]
-    )
-
-    p_volc <- ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log10_p,
-                                     color = sig)) +
-      geom_point_rast(size = 0.3, alpha = 0.5, dpi = 600) +
-      geom_hline(yintercept = -log10(alpha), linetype = "dashed", color = "grey40") +
-      geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
-      geom_text_repel(
-        data = top_genes,
-        aes(label = gene_name),
-        size = 3, segment.linetype = 2,
-        max.overlaps = 15, color = "black"
-      ) +
-      scale_color_manual(values = c("NS" = "#999999", "Sig" = "#ed9209")) +
-      facet_wrap(~ contrast_label, nrow = 1) +
-      labs(title = paste0(model_label, " Model -- ", ref),
-           x = "log2 Fold Change", y = "-log10(padj)", color = NULL) +
-      theme_report() +
-      theme(strip.text = element_text(size = 9))
-    print(p_volc)
-    cat("\n\n")
-  }
-
-  # ---- UpSet Plots ----
-  cat("\n\n### UpSet Plots\n\n")
-
-  res_adj_ref <- results_adj[[ref]]
-  if (!is.null(res_adj_ref)) {
-    # Build binary matrix: gene x contrast (sig up / sig down)
-    available_key <- intersect(key_contrasts, names(res_adj_ref))
-
-    if (length(available_key) >= 2) {
-      for (direction in c("up", "down")) {
-        upset_list <- lapply(available_key, function(cname) {
-          df <- res_adj_ref[[cname]]
-          if (is.null(df)) return(character(0))
-          if (direction == "up") {
-            df$gene_id[!is.na(df$padj) & df$padj <= alpha & df$log2FoldChange > 0]
-          } else {
-            df$gene_id[!is.na(df$padj) & df$padj <= alpha & df$log2FoldChange < 0]
-          }
-        })
-        names(upset_list) <- contrast_labels[available_key]
-
-        # Convert to binary data frame for ComplexUpset
-        all_genes <- unique(unlist(upset_list))
-        if (length(all_genes) < 2) {
-          cat(paste0("Fewer than 2 ", direction, "-regulated genes; skipping UpSet.\n\n"))
-          next
-        }
-
-        upset_df <- data.frame(gene_id = all_genes)
-        for (cname in names(upset_list)) {
-          upset_df[[cname]] <- upset_df$gene_id %in% upset_list[[cname]]
-        }
-
-        bar_color <- if (direction == "up") "lightblue" else "#d15469"
-        dir_label <- if (direction == "up") "Up-regulated" else "Down-regulated"
-
-        p_upset <- upset(
-          upset_df,
-          names(upset_list),
-          name = "Contrast",
-          min_size = 1,
-          base_annotations = list(
-            "Intersection size" = intersection_size(
-              bar_number_threshold = 1,
-              fill = bar_color
-            )
-          ),
-          themes = upset_default_themes(text = element_text(size = 8))
-        ) + ggtitle(paste0(dir_label, " DEGs (adjusted) -- ", ref))
-        print(p_upset)
-        cat("\n\n")
-      }
-    }
-  }
-
-  # ---- Adjustment Comparison ----
-  cat("\n\n### Adjustment Comparison\n\n")
+```{r de-adjustment, results='asis', fig.width=10, fig.height=6}
+for (ref in b6j_refs) {
+  cat("\n\n##", ref, "\n\n")
 
   comp_ref <- comparisons |> filter(reference == ref)
 
-  # Dot plot: padj adjusted vs unadjusted (key contrasts)
+  # Get CLR covariate names for this reference
+  clr_ref <- clr_covariates |> filter(reference == ref)
+
+  # Scatter: padj adjusted vs unadjusted (key contrasts)
   comp_key <- comp_ref |>
     filter(contrast %in% key_contrasts) |>
     mutate(
       neg_log10_adj = -log10(pmax(padj.adj, 1e-300)),
       neg_log10_unadj = -log10(pmax(padj.unadj, 1e-300)),
       contrast_label = factor(contrast, levels = key_contrasts,
-                              labels = contrast_labels[key_contrasts])
+                              labels = contrast_labels[key_contrasts]),
+      ct_assoc = ifelse(is.na(ct_assoc), "Neither", ct_assoc)
     )
 
-  if (nrow(comp_key) > 0) {
-    p_dot <- ggplot(comp_key, aes(x = neg_log10_unadj, y = neg_log10_adj)) +
-      geom_point_rast(size = 0.3, alpha = 0.3, color = "grey40", dpi = 600) +
+  if (nrow(comp_key) > 0 && nrow(clr_ref) == 2) {
+    # Build dynamic color palette for cell type association
+    ct1_label <- paste0(clr_ref$celltype[1], " only")
+    ct2_label <- paste0(clr_ref$celltype[2], " only")
+    assoc_levels <- c("Neither", ct1_label, ct2_label, "Both cell types")
+    assoc_colors <- c("Neither" = "#999999",
+                      setNames("#e41a1c", ct1_label),
+                      setNames("#377eb8", ct2_label),
+                      "Both cell types" = "#8856a7")
+    comp_key$ct_assoc <- factor(comp_key$ct_assoc, levels = assoc_levels)
+
+    # Dummy points to force equal axes per panel
+    axis_range <- comp_key |>
+      group_by(contrast_label) |>
+      summarise(
+        max_val = max(c(neg_log10_adj, neg_log10_unadj), na.rm = TRUE),
+        .groups = "drop"
+      )
+    dummy <- axis_range |>
+      mutate(neg_log10_unadj = max_val, neg_log10_adj = max_val)
+
+    p_dot <- ggplot(comp_key, aes(x = neg_log10_unadj, y = neg_log10_adj,
+                                   color = ct_assoc)) +
+      geom_blank(data = dummy, aes(x = neg_log10_unadj, y = neg_log10_adj),
+                 inherit.aes = FALSE) +
+      geom_point_rast(size = 0.3, alpha = 0.3, dpi = 600) +
       geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
       facet_wrap(~ contrast_label, scales = "free") +
-      labs(title = paste0("Adjustment Impact -- ", ref),
-           x = "-log10(padj) Unadjusted",
-           y = "-log10(padj) Adjusted") +
+      scale_color_manual(values = assoc_colors) +
+      labs(x = "-log10(padj) Unadjusted",
+           y = "-log10(padj) Adjusted",
+           color = "Cell type\nassociation") +
       theme_report()
     print(p_dot)
     cat("\n\n")
 
-    # Summary table: DEG counts
+    # DEG count table (key contrasts) with renamed columns
     adj_summary <- comp_key |>
       group_by(contrast_label) |>
       summarise(
-        n_sig_adj = sum(padj.adj <= alpha, na.rm = TRUE),
-        n_sig_unadj = sum(padj.unadj <= alpha, na.rm = TRUE),
-        n_adj_only = sum(adj_only_sig, na.rm = TRUE),
-        n_unadj_only = sum(unadj_only_sig, na.rm = TRUE),
-        n_both = sum(both_sig, na.rm = TRUE),
+        `Sig. (adjusted)` = sum(padj.adj <= alpha, na.rm = TRUE),
+        `Sig. (unadjusted)` = sum(padj.unadj <= alpha, na.rm = TRUE),
+        `Adjusted only` = sum(adj_only_sig, na.rm = TRUE),
+        `Unadjusted only` = sum(unadj_only_sig, na.rm = TRUE),
+        Both = sum(both_sig, na.rm = TRUE),
         .groups = "drop"
       )
-    print(knitr::kable(adj_summary, caption = paste0("DEG counts -- ", ref)))
+    print(styled_kable(adj_summary, caption = paste0("DEG counts (key contrasts) -- ", ref)))
     cat("\n\n")
 
-    # Impact bar chart
-    impact <- adj_summary |>
-      pivot_longer(cols = c(n_adj_only, n_unadj_only, n_both),
-                   names_to = "category", values_to = "n_genes") |>
-      mutate(category = factor(category,
-                               levels = c("n_adj_only", "n_unadj_only", "n_both"),
-                               labels = c("Adjusted only", "Unadjusted only", "Both")))
+    # Impact bar chart: cross-tabulate sig status × cell type association
+    impact_ct <- comp_key |>
+      mutate(
+        sig_status = case_when(
+          adj_only_sig  ~ "Adjusted only",
+          unadj_only_sig ~ "Unadjusted only",
+          both_sig ~ "Both",
+          TRUE ~ "Neither"
+        )
+      ) |>
+      filter(sig_status != "Neither") |>
+      count(contrast_label, sig_status, ct_assoc) |>
+      mutate(sig_status = factor(sig_status,
+                                 levels = c("Adjusted only", "Unadjusted only", "Both")))
 
-    set2_3 <- brewer.pal(3, "Set2")
-    p_impact <- ggplot(impact, aes(x = contrast_label, y = n_genes, fill = category)) +
-      geom_col(position = "dodge") +
-      scale_fill_manual(values = c("Adjusted only" = set2_3[1],
-                                   "Unadjusted only" = set2_3[2],
-                                   "Both" = set2_3[3])) +
-      labs(title = paste0("Impact of Composition Adjustment -- ", ref),
-           x = NULL, y = "Number of genes", fill = NULL) +
-      theme_report() +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
-    print(p_impact)
-    cat("\n\n")
+    if (nrow(impact_ct) > 0) {
+      p_impact <- ggplot(impact_ct, aes(x = contrast_label, y = n, fill = ct_assoc)) +
+        geom_col(position = "dodge") +
+        facet_wrap(~ sig_status) +
+        scale_fill_manual(values = assoc_colors) +
+        labs(x = NULL, y = "Number of genes", fill = "Cell type\nassociation") +
+        theme_report() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      print(p_impact)
+      cat("\n\n")
+    }
+  }
+}
+
+# Dynamic summary
+adj_impact <- comparisons |>
+  filter(reference %in% b6j_refs, contrast %in% key_contrasts) |>
+  summarise(
+    removed = sum(unadj_only_sig, na.rm = TRUE),
+    revealed = sum(adj_only_sig, na.rm = TRUE)
+  )
+cat(paste0(
+  "\n\nComposition adjustment removed ", adj_impact$removed,
+  " DEGs and revealed ", adj_impact$revealed,
+  " DEGs across key contrasts (B6J references).\n\n"
+))
+```
+
+---
+
+# What Genes Change With Treatment? {.tabset .tabset-pills}
+
+**B6J references only.**
+
+```{r volcano-setup}
+main_effects <- c("HU_vs_NL_MAIN_EFFECT", "IR_vs_Sham_MAIN_EFFECT",
+                  "KMP_vs_Sham_MAIN_EFFECT")
+interactions <- c("Interaction_KMP_x_HU", "Interaction_KMP_x_IR",
+                  "Interaction_HU_x_IR")
+pairwise_contrasts <- c("HU_vs_Ctrl", "IR_vs_Ctrl", "KMP_vs_Ctrl")
+volcano_contrasts <- c(main_effects, interactions, pairwise_contrasts)
+
+# Color palette for significance change (main effects side-by-side)
+change_pal <- c("Gained >1 mag." = "#2166AC",
+                "Lost >1 mag." = "#B2182B",
+                "Stable" = "#999999")
+```
+
+## Volcanos {.tabset .tabset-pills}
+
+```{r volcano-tabs, results='asis', fig.width=12, fig.height=6}
+for (ref in b6j_refs) {
+  cat("\n\n###", ref, "{.tabset .tabset-pills}\n\n")
+
+  res_adj_ref <- results_adj[[ref]]
+  res_unadj_ref <- results_unadj[[ref]]
+  if (is.null(res_adj_ref)) {
+    cat("No adjusted results available.\n\n")
+    next
   }
 
-  # ---- Full Sig Gene Counts ----
-  cat("\n\n### Full Sig Gene Counts\n\n")
+  for (contrast in volcano_contrasts) {
+    clabel <- if (contrast %in% names(contrast_labels)) {
+      contrast_labels[contrast]
+    } else {
+      contrast
+    }
+    cat("\n\n####", clabel, "\n\n")
 
+    adj_df <- res_adj_ref[[contrast]]
+    if (is.null(adj_df)) {
+      cat("No results for this contrast.\n\n")
+      next
+    }
+
+    adj_df <- adj_df |> left_join(gene_map, by = "gene_id")
+
+    if (contrast %in% main_effects && !is.null(res_unadj_ref[[contrast]])) {
+      # --- Side-by-side adjusted vs unadjusted (main effects) ---
+      unadj_df <- res_unadj_ref[[contrast]]
+
+      merged <- adj_df |>
+        select(gene_id, log2FoldChange, padj, gene_name) |>
+        inner_join(
+          unadj_df |> select(gene_id, log2FoldChange, padj),
+          by = "gene_id",
+          suffix = c(".adj", ".unadj")
+        ) |>
+        mutate(
+          neg_log10_adj = -log10(pmax(padj.adj, 1e-300)),
+          neg_log10_unadj = -log10(pmax(padj.unadj, 1e-300)),
+          delta = neg_log10_adj - neg_log10_unadj,
+          change_cat = factor(case_when(
+            delta > 1  ~ "Gained >1 mag.",
+            delta < -1 ~ "Lost >1 mag.",
+            TRUE ~ "Stable"
+          ), levels = c("Gained >1 mag.", "Lost >1 mag.", "Stable"))
+        )
+
+      top_adj <- merged |>
+        filter(!is.na(padj.adj) & padj.adj <= alpha) |>
+        slice_min(padj.adj, n = 10, with_ties = FALSE)
+      top_unadj <- merged |>
+        filter(!is.na(padj.unadj) & padj.unadj <= alpha) |>
+        slice_min(padj.unadj, n = 10, with_ties = FALSE)
+
+      p_adj <- ggplot(merged, aes(x = log2FoldChange.adj, y = neg_log10_adj,
+                                    color = change_cat)) +
+        geom_point_rast(size = 0.8, alpha = 0.5, dpi = 600) +
+        geom_hline(yintercept = -log10(alpha), linetype = "dashed", color = "grey40") +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+        geom_text_repel(
+          data = top_adj, aes(label = gene_name),
+          size = 3, segment.linetype = 2, max.overlaps = 15,
+          color = "black", fontface = "italic"
+        ) +
+        scale_color_manual(values = change_pal) +
+        labs(x = "log2 Fold Change", y = "-log10(padj)",
+             subtitle = "Adjusted") +
+        theme_report(base_size = 12) +
+        theme(legend.position = "none")
+
+      p_unadj <- ggplot(merged, aes(x = log2FoldChange.unadj, y = neg_log10_unadj,
+                                      color = change_cat)) +
+        geom_point_rast(size = 0.8, alpha = 0.5, dpi = 600) +
+        geom_hline(yintercept = -log10(alpha), linetype = "dashed", color = "grey40") +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+        geom_text_repel(
+          data = top_unadj, aes(label = gene_name),
+          size = 3, segment.linetype = 2, max.overlaps = 15,
+          color = "black", fontface = "italic"
+        ) +
+        scale_color_manual(values = change_pal) +
+        labs(x = "log2 Fold Change", y = "-log10(padj)",
+             subtitle = "Unadjusted") +
+        theme_report(base_size = 12)
+
+      p_combined <- p_adj | p_unadj
+      print(p_combined + plot_layout(guides = "collect"))
+      cat("\n\n")
+
+    } else {
+      # --- Single adjusted volcano (interactions + pairwise) ---
+      volcano_df <- adj_df |>
+        mutate(
+          neg_log10_p = -log10(pmax(padj, 1e-300)),
+          sig = ifelse(!is.na(padj) & padj <= alpha, "Sig", "NS")
+        )
+
+      top_genes <- volcano_df |>
+        filter(sig == "Sig") |>
+        slice_min(padj, n = 10, with_ties = FALSE)
+
+      p_volc <- ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log10_p,
+                                        color = sig)) +
+        geom_point_rast(size = 0.8, alpha = 0.5, dpi = 600) +
+        geom_hline(yintercept = -log10(alpha), linetype = "dashed", color = "grey40") +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+        geom_text_repel(
+          data = top_genes, aes(label = gene_name),
+          size = 3, segment.linetype = 2, max.overlaps = 15,
+          color = "black", fontface = "italic"
+        ) +
+        scale_color_manual(values = c("NS" = "#999999", "Sig" = "#ed9209")) +
+        labs(x = "log2 Fold Change", y = "-log10(padj)", color = NULL) +
+        theme_report(base_size = 12)
+      print(p_volc)
+      cat("\n\n")
+    }
+  }
+}
+```
+
+## UpSet {.tabset .tabset-pills}
+
+```{r upset-tabs, results='asis', fig.width=10, fig.height=6}
+for (ref in b6j_refs) {
+  cat("\n\n###", ref, "\n\n")
+
+  res_adj_ref <- results_adj[[ref]]
+  if (is.null(res_adj_ref)) {
+    cat("No adjusted results available.\n\n")
+    next
+  }
+
+  available_key <- intersect(key_contrasts, names(res_adj_ref))
+  if (length(available_key) < 2) {
+    cat("Fewer than 2 key contrasts available; skipping UpSet.\n\n")
+    next
+  }
+
+  for (direction in c("up", "down")) {
+    upset_list <- lapply(available_key, function(cname) {
+      df <- res_adj_ref[[cname]]
+      if (is.null(df)) return(character(0))
+      if (direction == "up") {
+        df$gene_id[!is.na(df$padj) & df$padj <= alpha & df$log2FoldChange > 0]
+      } else {
+        df$gene_id[!is.na(df$padj) & df$padj <= alpha & df$log2FoldChange < 0]
+      }
+    })
+    names(upset_list) <- contrast_labels[available_key]
+
+    all_genes <- unique(unlist(upset_list))
+    if (length(all_genes) < 2) {
+      cat(paste0("Fewer than 2 ", direction, "-regulated genes; skipping UpSet.\n\n"))
+      next
+    }
+
+    upset_df <- data.frame(gene_id = all_genes)
+    for (cname in names(upset_list)) {
+      upset_df[[cname]] <- upset_df$gene_id %in% upset_list[[cname]]
+    }
+
+    bar_color <- if (direction == "up") "lightblue" else "#d15469"
+    dir_label <- if (direction == "up") "Up-regulated" else "Down-regulated"
+
+    p_upset <- upset(
+      upset_df,
+      names(upset_list),
+      name = "Contrast",
+      min_size = 1,
+      min_degree = 2,
+      base_annotations = list(
+        "Intersection size" = intersection_size(
+          bar_number_threshold = 1,
+          fill = bar_color
+        )
+      ),
+      themes = upset_default_themes(text = element_text(size = 8))
+    ) + ggtitle(paste0(dir_label, " DEGs (adjusted) -- ", ref))
+    print(p_upset)
+    cat("\n\n")
+  }
+}
+```
+
+## Full Sig Gene Counts
+
+```{r full-sig-table, results='asis'}
+for (ref in b6j_refs) {
+  cat("\n\n###", ref, "{.unlisted .unnumbered}\n\n")
+
+  comp_ref <- comparisons |> filter(reference == ref)
   full_summary <- comp_ref |>
     group_by(contrast) |>
     summarise(
-      n_sig_adj = sum(padj.adj <= alpha, na.rm = TRUE),
-      n_sig_unadj = sum(padj.unadj <= alpha, na.rm = TRUE),
-      n_adj_only = sum(adj_only_sig, na.rm = TRUE),
-      n_unadj_only = sum(unadj_only_sig, na.rm = TRUE),
-      n_both = sum(both_sig, na.rm = TRUE),
+      `Sig. (adjusted)` = sum(padj.adj <= alpha, na.rm = TRUE),
+      `Sig. (unadjusted)` = sum(padj.unadj <= alpha, na.rm = TRUE),
+      `Adjusted only` = sum(adj_only_sig, na.rm = TRUE),
+      `Unadjusted only` = sum(unadj_only_sig, na.rm = TRUE),
+      Both = sum(both_sig, na.rm = TRUE),
       .groups = "drop"
     )
-  print(knitr::kable(full_summary,
+  print(styled_kable(full_summary,
                      caption = paste0("All 19 contrasts -- ", ref)))
   cat("\n\n")
 }
@@ -595,136 +939,190 @@ for (ref in refs) {
 
 ---
 
-# Gene Set Enrichment {.tabset .tabset-pills}
+# What Pathways Are Enriched? {.tabset .tabset-pills}
 
-```{r gsea-tabs, results='asis', fig.width=12, fig.height=8}
+**B6J references only. Comparing adjusted and unadjusted models.**
+
+```{r gsea-setup}
+# Map contrast_slug to readable labels
+slug_to_label <- contrast_labels
+names(slug_to_label) <- gsub("[^A-Za-z0-9_]", "_", names(contrast_labels))
+
+# Join adjusted and unadjusted GSEA results
+gsea_joined <- data.frame()
 if (nrow(gsea_summaries) > 0) {
-  for (ref in refs) {
-    gsea_ref <- gsea_summaries |> filter(reference == ref)
-    if (nrow(gsea_ref) == 0) {
-      cat("\n\n##", ref, "\n\n")
-      cat("No GSEA results available for this reference.\n\n")
+  gsea_adj_only <- gsea_summaries |>
+    filter(model == "adjusted") |>
+    select(ID, Description, NES, p.adjust, database, reference, contrast_slug, contrast_name)
+
+  gsea_unadj_only <- gsea_summaries |>
+    filter(model == "unadjusted") |>
+    select(ID, NES, p.adjust, database, reference, contrast_slug)
+
+  gsea_joined <- gsea_adj_only |>
+    inner_join(gsea_unadj_only,
+               by = c("ID", "contrast_slug", "reference", "database"),
+               suffix = c(".adj", ".unadj")) |>
+    mutate(
+      qscore_adj = -log10(pmax(p.adjust.adj, 1e-300)),
+      qscore_unadj = -log10(pmax(p.adjust.unadj, 1e-300)),
+      delta_q = qscore_adj - qscore_unadj,
+      contrast_label = ifelse(
+        contrast_slug %in% names(slug_to_label),
+        slug_to_label[contrast_slug],
+        contrast_name
+      )
+    )
+}
+
+# Helper to build a styled GT table
+build_gsea_gt <- function(df, title = NULL, subtitle = NULL) {
+  tbl <- df |>
+    select(contrast_label, Description, p.adjust.adj, qscore_adj,
+           p.adjust.unadj, qscore_unadj, delta_q)
+
+  gt(tbl, groupname_col = "contrast_label", rowname_col = "Description") |>
+    fmt_scientific(columns = c(p.adjust.adj, p.adjust.unadj), decimals = 2) |>
+    fmt_number(columns = c(qscore_adj, qscore_unadj, delta_q), decimals = 1) |>
+    cols_merge(
+      columns = c(p.adjust.adj, qscore_adj),
+      pattern = "{1} ({2})"
+    ) |>
+    cols_merge(
+      columns = c(p.adjust.unadj, qscore_unadj),
+      pattern = "{1} ({2})"
+    ) |>
+    cols_label(
+      p.adjust.adj = "p.adjust (Q-score)",
+      p.adjust.unadj = "p.adjust (Q-score)",
+      delta_q = html("&Delta; Q-score")
+    ) |>
+    tab_spanner(label = "Cell-type adj.", columns = p.adjust.adj) |>
+    tab_spanner(label = "Unadjusted", columns = p.adjust.unadj) |>
+    cols_align(align = "center", columns = c(p.adjust.adj, p.adjust.unadj, delta_q)) |>
+    opt_row_striping() |>
+    cols_width(Description ~ px(300)) |>
+    tab_style(
+      style = list(
+        cell_fill(color = "grey"),
+        cell_text(weight = "bold")
+      ),
+      locations = cells_row_groups()
+    ) |>
+    tab_header(title = title, subtitle = subtitle)
+}
+```
+
+## GO-BP {.tabset .tabset-pills}
+
+```{r gsea-go-tabs, results='asis'}
+if (nrow(gsea_joined) > 0) {
+  for (ref in b6j_refs) {
+    cat("\n\n###", ref, "\n\n")
+
+    go_ref <- gsea_joined |>
+      filter(reference == ref, database == "GO_BP")
+
+    if (nrow(go_ref) == 0) {
+      cat("No GO-BP GSEA results for this reference.\n\n")
       next
     }
 
-    cat("\n\n##", ref, "{.tabset}\n\n")
+    # Table 1: Top 5 terms per contrast (by adjusted Q-score)
+    top_go <- go_ref |>
+      group_by(contrast_label) |>
+      slice_max(qscore_adj, n = 5, with_ties = FALSE) |>
+      ungroup() |>
+      arrange(contrast_label, desc(qscore_adj))
 
-    for (model_type in c("adjusted", "unadjusted")) {
-      gsea_model <- gsea_ref |> filter(model == model_type)
-      if (nrow(gsea_model) == 0) {
-        cat("\n\n###", tools::toTitleCase(model_type), "\n\n")
-        cat("No GSEA results for ", model_type, " model.\n\n")
-        next
-      }
-
-      cat("\n\n###", tools::toTitleCase(model_type), "{.tabset}\n\n")
-
-      # --- GO Biological Process dot plot ---
-      cat("\n\n#### GO Biological Process\n\n")
-
-      go_data <- gsea_model |>
-        filter(database == "GO_BP", p.adjust <= 0.05)
-
-      # Map contrast_slug to readable labels
-      slug_to_label <- contrast_labels
-      names(slug_to_label) <- gsub("[^A-Za-z0-9_]", "_", names(contrast_labels))
-
-      if (nrow(go_data) > 0) {
-        go_key <- go_data |>
-          filter(contrast_slug %in% gsub("[^A-Za-z0-9_]", "_", key_contrasts)) |>
-          mutate(
-            contrast_label = ifelse(
-              contrast_slug %in% names(slug_to_label),
-              slug_to_label[contrast_slug],
-              contrast_name
-            ),
-            Description = str_wrap(Description, width = 30)
-          ) |>
-          group_by(contrast_label) |>
-          slice_min(p.adjust, n = 5, with_ties = FALSE) |>
-          ungroup()
-
-        if (nrow(go_key) > 0) {
-          p_go <- ggplot(go_key, aes(x = NES, y = reorder(Description, NES),
-                                     color = p.adjust, size = setSize)) +
-            geom_point() +
-            scale_color_viridis_c(option = "magma", direction = -1) +
-            facet_wrap(~ contrast_label, scales = "free_y") +
-            labs(title = paste0("GO-BP GSEA -- ", ref, " (", model_type, ")"),
-                 x = "NES", y = NULL, color = "p.adjust", size = "Gene set\nsize") +
-            theme_report() +
-            theme(
-              axis.text.y = element_text(size = 7),
-              strip.text = element_text(size = 9),
-              panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5)
-            )
-          print(p_go)
-        } else {
-          cat("No significant GO-BP results for key contrasts.\n\n")
-        }
-      } else {
-        cat("No significant GO-BP results (padj <= 0.05).\n\n")
-      }
+    if (nrow(top_go) > 0) {
+      cat("\n\n**Top pathways per contrast (adjusted model)**\n\n")
+      gt_top <- build_gsea_gt(top_go,
+                              title = "GO-BP: Top Pathways per Contrast",
+                              subtitle = ref)
+      print(as_raw_html(gt_top))
       cat("\n\n")
+    }
 
-      # --- KEGG dot plot ---
-      cat("\n\n#### KEGG Pathways\n\n")
+    # Table 2: Most changed pathways (by delta Q-score)
+    # Top 10 gained (became more significant after adjustment)
+    gained <- go_ref |>
+      arrange(desc(delta_q)) |>
+      slice_head(n = 10) |>
+      mutate(contrast_label = paste0(contrast_label, " [gained]"))
 
-      kegg_data <- gsea_model |>
-        filter(database == "KEGG", p.adjust <= 0.05)
+    # Top 10 lost (became less significant after adjustment)
+    lost <- go_ref |>
+      arrange(delta_q) |>
+      slice_head(n = 10) |>
+      mutate(contrast_label = paste0(contrast_label, " [lost]"))
 
-      if (nrow(kegg_data) > 0) {
-        kegg_key <- kegg_data |>
-          filter(contrast_slug %in% gsub("[^A-Za-z0-9_]", "_", key_contrasts)) |>
-          mutate(
-            contrast_label = ifelse(
-              contrast_slug %in% names(slug_to_label),
-              slug_to_label[contrast_slug],
-              contrast_name
-            ),
-            Description = str_wrap(Description, width = 30)
-          ) |>
-          group_by(contrast_label) |>
-          slice_min(p.adjust, n = 5, with_ties = FALSE) |>
-          ungroup()
+    most_changed <- bind_rows(gained, lost)
 
-        if (nrow(kegg_key) > 0) {
-          p_kegg <- ggplot(kegg_key, aes(x = NES, y = reorder(Description, NES),
-                                          color = p.adjust, size = setSize)) +
-            geom_point() +
-            scale_color_viridis_c(option = "magma", direction = -1) +
-            facet_wrap(~ contrast_label, scales = "free_y") +
-            labs(title = paste0("KEGG GSEA -- ", ref, " (", model_type, ")"),
-                 x = "NES", y = NULL, color = "p.adjust", size = "Gene set\nsize") +
-            theme_report() +
-            theme(
-              axis.text.y = element_text(size = 7),
-              strip.text = element_text(size = 9),
-              panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.5)
-            )
-          print(p_kegg)
-        } else {
-          cat("No significant KEGG results for key contrasts.\n\n")
-        }
-      } else {
-        cat("No significant KEGG results (padj <= 0.05).\n\n")
-      }
+    if (nrow(most_changed) > 0) {
+      cat("\n\n**Most changed pathways (adjusted vs unadjusted)**\n\n")
+      gt_changed <- build_gsea_gt(most_changed,
+                                  title = "GO-BP: Most Changed Pathways",
+                                  subtitle = ref)
+      print(as_raw_html(gt_changed))
       cat("\n\n")
+    }
+  }
+} else {
+  cat("\n\nNo GSEA results available.\n\n")
+}
+```
 
-      # --- Full table ---
-      cat("\n\n#### Full Table\n\n")
+## KEGG {.tabset .tabset-pills}
 
-      sig_all <- gsea_model |> filter(p.adjust <= 0.05)
-      if (nrow(sig_all) > 0) {
-        display_tbl <- sig_all |>
-          select(database, contrast_name, ID, Description, NES, p.adjust, setSize) |>
-          arrange(database, contrast_name, p.adjust)
-        print(knitr::kable(display_tbl, digits = 4,
-                           caption = paste0("Significant pathways -- ",
-                                            ref, " (", model_type, ")")))
-      } else {
-        cat("No significant pathways (padj <= 0.05).\n\n")
-      }
+```{r gsea-kegg-tabs, results='asis'}
+if (nrow(gsea_joined) > 0) {
+  for (ref in b6j_refs) {
+    cat("\n\n###", ref, "\n\n")
+
+    kegg_ref <- gsea_joined |>
+      filter(reference == ref, database == "KEGG")
+
+    if (nrow(kegg_ref) == 0) {
+      cat("No KEGG GSEA results for this reference.\n\n")
+      next
+    }
+
+    # Table 1: Top 5 terms per contrast (by adjusted Q-score)
+    top_kegg <- kegg_ref |>
+      group_by(contrast_label) |>
+      slice_max(qscore_adj, n = 5, with_ties = FALSE) |>
+      ungroup() |>
+      arrange(contrast_label, desc(qscore_adj))
+
+    if (nrow(top_kegg) > 0) {
+      cat("\n\n**Top pathways per contrast (adjusted model)**\n\n")
+      gt_top <- build_gsea_gt(top_kegg,
+                              title = "KEGG: Top Pathways per Contrast",
+                              subtitle = ref)
+      print(as_raw_html(gt_top))
+      cat("\n\n")
+    }
+
+    # Table 2: Most changed pathways
+    gained <- kegg_ref |>
+      arrange(desc(delta_q)) |>
+      slice_head(n = 10) |>
+      mutate(contrast_label = paste0(contrast_label, " [gained]"))
+
+    lost <- kegg_ref |>
+      arrange(delta_q) |>
+      slice_head(n = 10) |>
+      mutate(contrast_label = paste0(contrast_label, " [lost]"))
+
+    most_changed <- bind_rows(gained, lost)
+
+    if (nrow(most_changed) > 0) {
+      cat("\n\n**Most changed pathways (adjusted vs unadjusted)**\n\n")
+      gt_changed <- build_gsea_gt(most_changed,
+                                  title = "KEGG: Most Changed Pathways",
+                                  subtitle = ref)
+      print(as_raw_html(gt_changed))
       cat("\n\n")
     }
   }
@@ -735,45 +1133,13 @@ if (nrow(gsea_summaries) > 0) {
 
 ---
 
-# Methods Summary
-
-## CLR Covariate Selection
-
-The composition-adjusted DESeq2 model includes CLR-transformed proportions
-of the **top 2 most abundant cell types** (by mean proportion across all samples)
-as covariates. This limits the number of added covariates to avoid overfitting,
-particularly for references with many cell types.
-
-```{r clr-table}
-if (nrow(clr_covariates) > 0) {
-  knitr::kable(clr_covariates,
-               caption = "Top-2 CLR covariates per reference")
-}
-```
-
-## GSEA Ranking Metric
-
-Genes are ranked by **signed -log10(p-value)**: `-log10(pvalue) * sign(log2FoldChange)`.
-This weights both statistical significance and effect direction, matching the
-approach in [Gural et al. 2025](https://doi.org/10.1371/journal.pgen.1011807).
-
-GSEA was run using clusterProfiler's `gseGO()` (GO Biological Process, ENSEMBL IDs)
-and `gseKEGG()` (KEGG pathways, ENTREZID). Parameters: minGSSize=10, maxGSSize=500,
-BH adjustment, eps=0.
-
-## DE Model Formulas
-
-- **Adjusted:** `~ 0 + group + clr.CellType1 + clr.CellType2`
-- **Unadjusted:** `~ 0 + group`
-
-Both use cell-means parameterization with 19 numeric contrast vectors
-(10 pairwise, 3 main effects, 3 marginal means, 3 two-way interactions).
-LFC shrinkage via ashr.
-
----
-
 # Session Info
+
+<details>
+<summary>Click to expand</summary>
 
 ```{r session-info}
 sessionInfo()
 ```
+
+</details>

@@ -236,6 +236,8 @@ rule decon_summary:
                          ref=DECON_REFS),
         contrast_idx = expand("data/processed/models/{ref}_contrast_index.csv",
                               ref=DECON_REFS),
+        dds_adj = expand("data/processed/models/{ref}_dds_adjusted.rds",
+                         ref=DECON_REFS),
         config_file = "scripts/setup/config.json",
         rmd = "scripts/decon/05_summarize.Rmd"
     output:
